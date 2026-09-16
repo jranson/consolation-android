@@ -75,7 +75,12 @@ private:
 	int frameMode;
 	size_t frameBytes;
 	pthread_t preview_thread;
+	/** Guards mPreviewWindow and the GPU/CPU render into it. */
 	pthread_mutex_t preview_mutex;
+	/** Guards preview_frame_ring + preview_sync only. Kept separate from
+	 * preview_mutex so a producer's enqueue never blocks behind the preview
+	 * thread's render + eglSwapBuffers (which hold preview_mutex). */
+	pthread_mutex_t preview_queue_mutex;
 	pthread_cond_t preview_sync;
 	/** Incoming frames; fixed ring, O(1) enqueue with drop-oldest on overflow */
 	BoundedPointerRing<uvc_frame_t *> preview_frame_ring;

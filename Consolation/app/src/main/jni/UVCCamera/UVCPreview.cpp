@@ -224,6 +224,7 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	ENTER();
 	pthread_cond_init(&preview_sync, NULL);
 	pthread_mutex_init(&preview_mutex, NULL);
+	pthread_mutex_init(&preview_queue_mutex, NULL);
 	pthread_cond_init(&mjpeg_decode_sync, NULL);
 	pthread_mutex_init(&mjpeg_decode_mutex, NULL);
 //
@@ -291,6 +292,7 @@ UVCPreview::~UVCPreview() {
 	clearCaptureFrame();
 	clear_pool();
 	pthread_mutex_destroy(&preview_mutex);
+	pthread_mutex_destroy(&preview_queue_mutex);
 	pthread_cond_destroy(&preview_sync);
 	pthread_mutex_destroy(&mjpeg_decode_mutex);
 	pthread_cond_destroy(&mjpeg_decode_sync);
@@ -862,11 +864,11 @@ int UVCPreview::startPreview() {
 		if (UNLIKELY(result != EXIT_SUCCESS)) {
 			LOGW("UVCCamera::window does not exist/already running/could not create thread etc.");
 			mIsRunning = false;
-			pthread_mutex_lock(&preview_mutex);
+			pthread_mutex_lock(&preview_queue_mutex);
 			{
 				pthread_cond_signal(&preview_sync);
 			}
-			pthread_mutex_unlock(&preview_mutex);
+			pthread_mutex_unlock(&preview_queue_mutex);
 		}
 	}
 	RETURN(result, int);
@@ -877,7 +879,11 @@ int UVCPreview::stopPreview() {
 	bool b = isRunning();
 	if (LIKELY(b)) {
 		mIsRunning = false;
+		/* Signal under the queue lock so a waiter that has checked isRunning()
+		 * but not yet entered cond_wait cannot miss this wakeup. */
+		pthread_mutex_lock(&preview_queue_mutex);
 		pthread_cond_signal(&preview_sync);
+		pthread_mutex_unlock(&preview_queue_mutex);
 		pthread_mutex_lock(&mjpeg_decode_mutex);
 		pthread_cond_signal(&mjpeg_decode_sync);
 		pthread_mutex_unlock(&mjpeg_decode_mutex);
@@ -1357,7 +1363,7 @@ uvc_frame_t *UVCPreview::convertPreviewFrameToRgbx(uvc_frame_t *frame) {
 
 void UVCPreview::addPreviewFrame(uvc_frame_t *frame) {
 
-	pthread_mutex_lock(&preview_mutex);
+	pthread_mutex_lock(&preview_queue_mutex);
 	if (isRunning()) {
 		uvc_frame_t *drop = preview_frame_ring.enqueue_drop_oldest_if_full(frame);
 		const uint64_t queued_backlog =
@@ -1374,34 +1380,34 @@ void UVCPreview::addPreviewFrame(uvc_frame_t *frame) {
 		frame = nullptr;
 		pthread_cond_signal(&preview_sync);
 	}
-	pthread_mutex_unlock(&preview_mutex);
+	pthread_mutex_unlock(&preview_queue_mutex);
 	if (frame)
 		recycle_frame(frame);
 }
 
 uvc_frame_t *UVCPreview::waitPreviewFrame() {
 	uvc_frame_t *frame = nullptr;
-	pthread_mutex_lock(&preview_mutex);
+	pthread_mutex_lock(&preview_queue_mutex);
 	{
 		while (isRunning() && preview_frame_ring.empty())
-			pthread_cond_wait(&preview_sync, &preview_mutex);
+			pthread_cond_wait(&preview_sync, &preview_queue_mutex);
 		if (LIKELY(isRunning() && !preview_frame_ring.empty())) {
 			frame = preview_frame_ring.dequeue();
 			recordPreviewQueueDepthSample(static_cast<uint64_t>(preview_frame_ring.size()));
 		}
 	}
-	pthread_mutex_unlock(&preview_mutex);
+	pthread_mutex_unlock(&preview_queue_mutex);
 	return frame;
 }
 
 void UVCPreview::clearPreviewFrame() {
-	pthread_mutex_lock(&preview_mutex);
+	pthread_mutex_lock(&preview_queue_mutex);
 	{
 		while (!preview_frame_ring.empty())
 			recycle_frame(preview_frame_ring.dequeue());
 		preview_frame_ring.reset_storage();
 	}
-	pthread_mutex_unlock(&preview_mutex);
+	pthread_mutex_unlock(&preview_queue_mutex);
 }
 
 void *UVCPreview::preview_thread_func(void *vptr_args) {
