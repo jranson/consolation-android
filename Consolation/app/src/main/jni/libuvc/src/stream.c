@@ -192,6 +192,7 @@ static void _uvc_discard_assembled_frame(uvc_stream_handle_t *strmh, const char 
 	strmh->pts = 0;
 	strmh->bfh_err = 0;
 	_uvc_diag_iso_frame_reset(strmh);
+	_uvc_mjpeg_scan_reset(strmh);
 }
 
 struct format_table_entry {
@@ -763,6 +764,7 @@ void _uvc_swap_buffers(uvc_stream_handle_t *strmh, const char *reason) {
 	strmh->pts = 0;
 	strmh->bfh_err = 0;	// XXX
 	_uvc_diag_iso_frame_reset(strmh);
+	_uvc_mjpeg_scan_reset(strmh);
 }
 
 /* Unified transfer-slot cleanup:
@@ -1470,6 +1472,7 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 	memset(strmh->stalled_transfer_slots, 0, sizeof(strmh->stalled_transfer_slots));
 	memset(strmh->iso_transfer_pending, 0, sizeof(strmh->iso_transfer_pending));
 	_uvc_diag_iso_frame_reset(strmh);
+	_uvc_mjpeg_scan_reset(strmh);
 
 	frame_desc = uvc_find_frame_desc_stream(strmh, ctrl->bFormatIndex, ctrl->bFrameIndex);
 	if (UNLIKELY(!frame_desc)) {

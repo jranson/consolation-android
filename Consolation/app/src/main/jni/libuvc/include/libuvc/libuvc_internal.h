@@ -329,6 +329,12 @@ struct uvc_stream_handle {
   uint32_t last_scr, hold_last_scr;
   uint64_t frame_start_monotonic_ns, frame_complete_monotonic_ns, hold_start_monotonic_ns;
   size_t got_bytes, hold_bytes;
+  /* Incremental MJPEG marker scan of outbuf (see _uvc_mjpeg_note_payload_append):
+   * mjpeg_scan_pos = next pair index to examine; flags accumulate per frame.
+   * Lets _uvc_swap_buffers validate without a second full pass over the JPEG. */
+  size_t mjpeg_scan_pos;
+  uint8_t mjpeg_scan_found_sos;
+  uint8_t mjpeg_scan_embedded_soi;
   size_t size_buf;	// XXX add for boundary check
   uint8_t *outbuf, *holdbuf;
   uint8_t *frame_pool[LIBUVC_FRAME_POOL_SLOTS];

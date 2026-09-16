@@ -122,6 +122,10 @@ void _uvc_diag_iso_frame_reset(uvc_stream_handle_t *strmh) {
 	strmh->diag_iso_packet_len_hash = 2166136261u;
 }
 
+#if UVC_RUNTIME_DIAG_ENABLED
+/* Per-byte payload hash and packet-shape stats feed only _uvc_diag_mjpeg_publish,
+ * which is compiled out unless UVC_RUNTIME_DIAG_ENABLED.  Keep them out of the
+ * USB reap path otherwise: the hash alone is a serial full pass over every frame. */
 static void _uvc_diag_iso_payload_bytes(uvc_stream_handle_t *strmh,
 		const uint8_t *data, size_t len) {
 	size_t i;
@@ -159,6 +163,7 @@ static void _uvc_diag_iso_packet_shape(uvc_stream_handle_t *strmh,
 	strmh->diag_iso_packet_len_hash ^= (uint32_t)(len >> 16);
 	strmh->diag_iso_packet_len_hash *= 16777619u;
 }
+#endif /* UVC_RUNTIME_DIAG_ENABLED */
  
  static void _uvc_process_payload_iso_packet(uvc_stream_handle_t *strmh,
 		 const uint8_t *payload, size_t payload_len) {
@@ -240,7 +245,9 @@ static void _uvc_diag_iso_packet_shape(uvc_stream_handle_t *strmh,
 		 strmh->first_video_payload_received = 1;
 		 _uvc_diag_first_payload(strmh, data_len, "iso");
 		 if (LIKELY(strmh->got_bytes + data_len <= strmh->size_buf)) {
+#if UVC_RUNTIME_DIAG_ENABLED
 			 _uvc_diag_iso_payload_bytes(strmh, payload + header_len, data_len);
+#endif
 			 memcpy(strmh->outbuf + strmh->got_bytes, payload + header_len, data_len);
 			 strmh->got_bytes += data_len;
 			 _uvc_mjpeg_note_payload_append(strmh);
@@ -280,7 +287,9 @@ static void _uvc_diag_iso_packet_shape(uvc_stream_handle_t *strmh,
 			 continue;
 		 }
 
+#if UVC_RUNTIME_DIAG_ENABLED
 		 _uvc_diag_iso_packet_shape(strmh, packet->actual_length, packet->length);
+#endif
 		 payload = libusb_get_iso_packet_buffer_simple(transfer, packet_id);
 		 _uvc_process_payload_iso_packet(strmh, payload, packet->actual_length);
 	 }
