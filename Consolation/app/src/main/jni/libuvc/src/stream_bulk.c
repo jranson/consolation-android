@@ -45,6 +45,8 @@ void _uvc_process_payload_bulk(uvc_stream_handle_t *strmh, const uint8_t *payloa
 
 	if (UNLIKELY(header_len < 2)) {
 		header_info = 0;
+		if (_uvc_mjpeg_eoi_pending(strmh))
+			return;	/* no status bits; never append past a held EOI */
 	} else {
 		//  @todo we should be checking the end-of-header bit
 		size_t variable_offset = 2;
@@ -130,7 +132,7 @@ void _uvc_process_payload_bulk(uvc_stream_handle_t *strmh, const uint8_t *payloa
 			memcpy(strmh->outbuf + strmh->got_bytes, payload + header_len, data_len);
 			strmh->got_bytes += data_len;
 			if (_uvc_mjpeg_note_payload_append(strmh)) {
-				_uvc_mjpeg_publish_on_eoi(strmh, "bulk-eoi");
+				_uvc_mjpeg_publish_on_eoi(strmh, header_info, "bulk-eoi");
 				return;
 			}
 		} else {

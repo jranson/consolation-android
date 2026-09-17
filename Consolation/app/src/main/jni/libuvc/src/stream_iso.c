@@ -303,6 +303,8 @@ static unsigned int _uvc_iso_host_packet_cap(uvc_stream_handle_t *strmh) {
  
 	 if (UNLIKELY(header_len < 2)) {
 		 header_info = 0;
+		 if (_uvc_mjpeg_eoi_pending(strmh))
+			 return;	/* no status bits; never append past a held EOI */
 	 } else {
 		 size_t variable_offset = 2;
  
@@ -384,7 +386,7 @@ static unsigned int _uvc_iso_host_packet_cap(uvc_stream_handle_t *strmh) {
 			 memcpy(strmh->outbuf + strmh->got_bytes, payload + header_len, data_len);
 			 strmh->got_bytes += data_len;
 			 if (_uvc_mjpeg_note_payload_append(strmh)) {
-				 _uvc_mjpeg_publish_on_eoi(strmh, "iso-eoi");
+				 _uvc_mjpeg_publish_on_eoi(strmh, header_info, "iso-eoi");
 				 return;
 			 }
 		 } else {
@@ -418,7 +420,9 @@ static unsigned int _uvc_iso_host_packet_cap(uvc_stream_handle_t *strmh) {
 		 }
 		 if (UNLIKELY(packet->actual_length <= 0)) {
 			 strmh->diag_iso_zero_packets++;
-			 if (strmh->got_bytes)
+			 /* A gap inside a frame is a hole; a gap after its EOI is just
+			  * the device idling before the trailer or the next frame. */
+			 if (strmh->got_bytes && !_uvc_mjpeg_eoi_pending(strmh))
 				 strmh->bfh_err |= UVC_STREAM_ERR;
 			 continue;
 		 }

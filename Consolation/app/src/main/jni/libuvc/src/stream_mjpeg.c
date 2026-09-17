@@ -104,6 +104,7 @@ void _uvc_mjpeg_scan_reset(uvc_stream_handle_t *strmh) {
 		return;
 	/* Note: mjpeg_eoi_skip_* deliberately survive this reset; they are
 	 * cleared by the next FID flip (see _uvc_mjpeg_payload_after_eoi). */
+	strmh->mjpeg_eoi_pending = 0;
 	strmh->mjpeg_scan_pos = 0;
 	strmh->mjpeg_scan_found_sos = 0;
 	strmh->mjpeg_scan_embedded_soi = 0;
@@ -186,26 +187,69 @@ int _uvc_mjpeg_note_payload_append(uvc_stream_handle_t *strmh) {
  * next transfer completes) or for the FID flip (a whole frame interval later
  * on cameras that never set EOF) only adds latency.  FFD9 cannot occur inside
  * entropy-coded data (0xFF is always stuffed), so the tail check is exact.
+ *
+ * Complete is not the same as valid, though: a header-only trailer for this
+ * frame can still carry UVC_STREAM_ERR (the frame has a transmission hole but
+ * intact SOI/EOI).  So the frame is only published straight away when the
+ * payload that carried the EOI also carried EOF.  Otherwise it is held until
+ * a definitive boundary: a trailer with EOF, an FID flip, or the next frame's
+ * SOI.  Idle ISO slots and past behaviour of the device prove nothing about
+ * whether a trailer is still coming, so neither releases a held frame.
  */
-void _uvc_mjpeg_publish_on_eoi(uvc_stream_handle_t *strmh, const char *reason) {
-	if (!strmh || strmh->frame_format != UVC_FRAME_FORMAT_MJPEG)
-		return;
+static void _uvc_mjpeg_eoi_publish_now(uvc_stream_handle_t *strmh, const char *reason) {
+	strmh->mjpeg_eoi_pending = 0;
 	strmh->mjpeg_eoi_skip_valid = 1;
 	strmh->mjpeg_eoi_skip_fid = strmh->fid;
 	_uvc_swap_buffers(strmh, reason);
 }
 
+void _uvc_mjpeg_publish_on_eoi(uvc_stream_handle_t *strmh, uint8_t header_info,
+		const char *reason) {
+	if (!strmh || strmh->frame_format != UVC_FRAME_FORMAT_MJPEG)
+		return;
+	if (header_info & UVC_STREAM_EOF) {
+		_uvc_mjpeg_eoi_publish_now(strmh, reason);
+		return;
+	}
+	strmh->mjpeg_eoi_pending = 1;
+	strmh->mjpeg_eoi_pending_reason = reason;
+}
+
+int _uvc_mjpeg_eoi_pending(const uvc_stream_handle_t *strmh) {
+	return strmh && strmh->mjpeg_eoi_pending;
+}
+
 int _uvc_mjpeg_payload_after_eoi(uvc_stream_handle_t *strmh, uint8_t header_info,
 		const uint8_t *data, size_t data_len) {
+	const int new_frame =
+		((header_info & UVC_STREAM_FID) != (strmh->mjpeg_eoi_pending
+			? strmh->fid : strmh->mjpeg_eoi_skip_fid))
+		/* New SOI under the same FID (camera does not toggle FID). */
+		|| (data_len >= 2 && data[0] == 0xff && data[1] == 0xd8);
+
+	if (strmh->mjpeg_eoi_pending) {
+		if (new_frame) {
+			/* No trailer was sent: the held frame stands as assembled. */
+			_uvc_mjpeg_eoi_publish_now(strmh, strmh->mjpeg_eoi_pending_reason);
+			strmh->mjpeg_eoi_skip_valid = 0;
+			return 0;	/* this payload starts the next frame: process it */
+		}
+		/* Trailer (or padding) of the held frame: its ERR bit still counts. */
+		if (header_info & UVC_STREAM_ERR) {
+			strmh->bfh_err |= UVC_STREAM_ERR;	/* dropped at publish */
+			strmh->diag_bfh_err_packets++;
+		}
+		if (header_info & UVC_STREAM_EOF) {
+			_uvc_mjpeg_eoi_publish_now(strmh, strmh->mjpeg_eoi_pending_reason);
+			strmh->mjpeg_eoi_skip_valid = 0;	/* explicit end of the frame */
+		}
+		return 1;
+	}
+
 	if (!strmh->mjpeg_eoi_skip_valid)
 		return 0;
-	if ((header_info & UVC_STREAM_FID) != strmh->mjpeg_eoi_skip_fid) {
-		strmh->mjpeg_eoi_skip_valid = 0;	/* FID flipped: next frame begins */
-		return 0;
-	}
-	if (data_len >= 2 && data[0] == 0xff && data[1] == 0xd8) {
-		/* New SOI under the same FID (camera does not toggle FID): process it. */
-		strmh->mjpeg_eoi_skip_valid = 0;
+	if (new_frame) {
+		strmh->mjpeg_eoi_skip_valid = 0;	/* next frame begins */
 		return 0;
 	}
 	if (header_info & UVC_STREAM_EOF)

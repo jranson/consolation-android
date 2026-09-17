@@ -973,9 +973,23 @@ class UvccameraLibPreviewBackend(
                 Log.i(logTag, "playback: usb bandwidth hint unavailable; auto prefers uncompressed")
             }
             val autoOrder = buildAutoFormatOrder(nativeFrameFormat, lowBandwidthHint == true)
-            val selectedOrder = preferredPixelFormatOverride?.let { pref ->
+            val requestedOrder = preferredPixelFormatOverride?.let { pref ->
                 listOf(pref) + autoOrder.filter { it != pref }
             } ?: autoOrder
+            /* The UI binds a SurfaceView for every non-H.264 request and relies on the native
+             * renderer for rotation/mirror/zoom/pan. MediaCodec output bypasses that renderer (and
+             * Compose cannot transform a SurfaceView), so never fall back to H.264 on a holder. */
+            val selectedOrder = if (target is PreviewTarget.Holder &&
+                preferredPixelFormatOverride != UVCCamera.FRAME_FORMAT_H264
+            ) {
+                requestedOrder.filter { it != UVCCamera.FRAME_FORMAT_H264 }.also {
+                    if (it.size != requestedOrder.size) {
+                        Log.i(logTag, "playback: H.264 fallback excluded for SurfaceView target")
+                    }
+                }
+            } else {
+                requestedOrder
+            }
             val selectedFrameFormat = selectedOrder.firstNotNullOfOrNull { format ->
                 trySetPreviewSize(camera, width, height, minFps, maxFps, fps, format, bwFactor).also {
                     if (it != null) {

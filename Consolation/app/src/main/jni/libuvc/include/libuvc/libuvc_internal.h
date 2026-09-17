@@ -346,6 +346,10 @@ struct uvc_stream_handle {
    * FID flips, so they cannot start a bogus SOI-less frame. */
   uint8_t mjpeg_eoi_skip_valid;
   uint8_t mjpeg_eoi_skip_fid;
+  /* EOI seen but the frame is held until its trailing UVC status is known:
+   * a later header-only payload may still carry EOF/ERR for this frame. */
+  uint8_t mjpeg_eoi_pending;
+  const char *mjpeg_eoi_pending_reason;
   size_t size_buf;	// XXX add for boundary check
   uint8_t *outbuf, *holdbuf;
   uint8_t *frame_pool[LIBUVC_FRAME_POOL_SLOTS];

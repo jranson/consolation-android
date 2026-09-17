@@ -484,8 +484,10 @@ public class UVCCamera {
 	/**
 	 * Rotation (0/90/180/270), mirror flags, zoom scale and pan (in NDC units,
 	 * -1..1 across the surface) applied by the native GPU renderer.
+	 * Synchronized with {@link #destroy()}: the UI thread calls this while the
+	 * preview executor may be freeing the native object.
 	 */
-	public void setPreviewTransform(final int rotationDegrees, final boolean flipH,
+	public synchronized void setPreviewTransform(final int rotationDegrees, final boolean flipH,
 			final boolean flipV, final float scale, final float panXNdc, final float panYNdc) {
 		if (mNativePtr != 0) {
 			nativeSetPreviewTransform(mNativePtr, rotationDegrees, flipH, flipV, scale, panXNdc, panYNdc);
@@ -497,7 +499,7 @@ public class UVCCamera {
      * @param callback
      * @param pixelFormat
      */
-    public void setFrameCallback(final IFrameCallback callback, final int pixelFormat) {
+    public synchronized void setFrameCallback(final IFrameCallback callback, final int pixelFormat) {
     	if (mNativePtr != 0) {
         	nativeSetFrameCallback(mNativePtr, callback, pixelFormat);
     	}
@@ -510,13 +512,13 @@ public class UVCCamera {
 	 * deliver lightweight rendered-frame notifications so apps can count frames without entering
 	 * the capture path.
 	 */
-	public void setPreviewFrameCallback(final IFrameCallback callback, final int pixelFormat) {
+	public synchronized void setPreviewFrameCallback(final IFrameCallback callback, final int pixelFormat) {
 		if (mNativePtr != 0) {
 			nativeSetPreviewFrameCallback(mNativePtr, callback, pixelFormat);
 		}
 	}
 
-	public long[] getAndResetProcessingStats() {
+	public synchronized long[] getAndResetProcessingStats() {
 		if (mNativePtr != 0) {
 			final long[] stats = nativeGetAndResetProcessingStats(mNativePtr);
 			if (stats != null) {

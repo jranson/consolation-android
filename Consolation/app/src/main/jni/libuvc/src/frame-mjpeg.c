@@ -45,6 +45,7 @@
 #include <turbojpeg.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <stdio.h>
 #include <string.h>
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -110,6 +111,15 @@ struct mjpeg_decoder_ctx {
 	struct jpeg_decompress_struct dinfo;
 	tjhandle tj;
 	int initialized;
+	/* Planar-decode warning policy (see _mjpeg_planar_warning_tolerated).
+	 * Lives with the decoder instance so one stream's verdict is never
+	 * inherited by another, and is reset when a new stream is detected. */
+	uint32_t warn_drops;
+	uint32_t warn_pad_streak;	/* consecutive frames with verified EOI padding */
+	uint8_t warn_pad_fill;		/* fill byte of that padding */
+	uint8_t warn_pad_logged;
+	uint32_t warn_last_seq;
+	uint32_t warn_width, warn_height;
 };
 
 static pthread_key_t mjpeg_decoder_key;
@@ -770,6 +780,103 @@ uvc_error_t uvc_mjpeg_planar_layout(uvc_frame_t *in, uint32_t widths[3],
 	return UVC_SUCCESS;
 }
 
+/*
+ * libjpeg warnings after a "successful" decode mean the bitstream was damaged:
+ * a few bytes inserted or dropped desyncs the Huffman decoder with no restart
+ * markers, so the top decodes and everything below is shredded, ending in
+ * "premature end" (bytes missing) or "N extraneous bytes before marker" (bytes
+ * inserted).  Both were observed on a MUSB USB 2.0 host; such frames are
+ * dropped so the last good one stays on glass.
+ *
+ * The one benign case is a camera that pads every frame between the end of the
+ * entropy-coded data and EOI.  That is only accepted when it is positively
+ * identified, never merely because the warning is persistent (persistent
+ * transport corruption warns on every frame too):
+ *   - the first (reported) warning is exactly "N extraneous bytes before
+ *     marker 0xd9", so nothing was wrong before the scan data ended,
+ *   - the N bytes immediately before the trailing FFD9 are one repeated fill
+ *     byte (leftover entropy-coded data from a desync is not uniform), and
+ *   - UVC_MJPEG_PAD_TRUST consecutive frames had that shape with the same
+ *     fill byte.
+ * Any other warning rejects the frame and restarts that count.
+ */
+#define UVC_MJPEG_PAD_TRUST 60
+
+static void _mjpeg_planar_warning_track_stream(struct mjpeg_decoder_ctx *ctx,
+		const uvc_frame_t *in) {
+	/* New stream (sequence restarted) or new mode: forget the old verdict. */
+	if (in->sequence < ctx->warn_last_seq
+			|| in->width != ctx->warn_width || in->height != ctx->warn_height) {
+		ctx->warn_drops = 0;
+		ctx->warn_pad_streak = 0;
+		ctx->warn_pad_logged = 0;
+		ctx->warn_width = in->width;
+		ctx->warn_height = in->height;
+	}
+	ctx->warn_last_seq = in->sequence;
+}
+
+static void _mjpeg_planar_warning_clean(struct mjpeg_decoder_ctx *ctx,
+		const uvc_frame_t *in) {
+	_mjpeg_planar_warning_track_stream(ctx, in);
+	ctx->warn_pad_streak = 0;
+	ctx->warn_pad_logged = 0;
+}
+
+/* 1 and *fill set when msg/in describe uniform fill padding before EOI. */
+static int _mjpeg_warning_is_eoi_padding(const uvc_frame_t *in, const char *msg,
+		uint8_t *fill) {
+	const uint8_t *data = (const uint8_t *)in->data;
+	const size_t len = in->actual_bytes;
+	const char *p = msg ? strstr(msg, "Corrupt JPEG data: ") : NULL;
+	unsigned int discarded = 0, marker = 0;
+	size_t i;
+
+	if (!p || sscanf(p, "Corrupt JPEG data: %u extraneous bytes before marker 0x%x",
+			&discarded, &marker) != 2)
+		return 0;
+	if (marker != 0xd9 || !discarded || (size_t)discarded + 4 > len)
+		return 0;
+	if (data[len - 2] != 0xff || data[len - 1] != 0xd9)
+		return 0;
+	*fill = data[len - 3];
+	for (i = 0; i < discarded; i++) {
+		if (data[len - 3 - i] != *fill)
+			return 0;
+	}
+	return 1;
+}
+
+static int _mjpeg_planar_warning_tolerated(struct mjpeg_decoder_ctx *ctx,
+		const uvc_frame_t *in, const char *msg) {
+	uint8_t fill = 0;
+
+	_mjpeg_planar_warning_track_stream(ctx, in);
+	if (_mjpeg_warning_is_eoi_padding(in, msg, &fill)) {
+		if (ctx->warn_pad_streak && fill != ctx->warn_pad_fill)
+			ctx->warn_pad_streak = 0;
+		ctx->warn_pad_fill = fill;
+		if (ctx->warn_pad_streak >= UVC_MJPEG_PAD_TRUST) {
+			if (!ctx->warn_pad_logged) {
+				ctx->warn_pad_logged = 1;
+				LOGW("mjpeg planar decode: every frame is 0x%02x-padded before EOI (%s); accepting",
+					(unsigned)fill, msg);
+			}
+			return 1;
+		}
+		ctx->warn_pad_streak++;
+	} else {
+		ctx->warn_pad_streak = 0;
+		ctx->warn_pad_logged = 0;
+	}
+
+	ctx->warn_drops++;
+	if (ctx->warn_drops <= 5 || !(ctx->warn_drops % 300))
+		LOGW("mjpeg planar decode dropped corrupt frame count=%u seq=%u bytes=%zu warn=%s",
+			ctx->warn_drops, in->sequence, in->actual_bytes, msg ? msg : "?");
+	return 0;
+}
+
 uvc_error_t uvc_mjpeg2yuv_planes(uvc_frame_t *in, unsigned char *planes[3],
 		const int strides[3]) {
 	struct mjpeg_decoder_ctx *decoder;
@@ -791,37 +898,11 @@ uvc_error_t uvc_mjpeg2yuv_planes(uvc_frame_t *in, unsigned char *planes[3],
 			tj3GetErrorStr(tj));
 		return UVC_ERROR_OTHER;
 	}
-	{
-		/* libjpeg warnings after a "successful" decode mean the bitstream was
-		 * damaged: a few bytes inserted or dropped desyncs the Huffman decoder
-		 * with no restart markers, so the top decodes and everything below is
-		 * shredded, ending in "premature end" (bytes missing) or "N extraneous
-		 * bytes before marker" (bytes inserted).  Both were observed on a MUSB
-		 * USB 2.0 host; drop such frames so the last good one stays on glass.
-		 * Some cameras pad every frame and warn every time; if warnings become
-		 * continuous (>= 60 in a row) we assume that and stop dropping until a
-		 * clean frame is seen again. */
-		static uint32_t s_warning_drops, s_consecutive_warnings;
-		static int s_tolerate_logged;
-		const int warned = tj3GetErrorCode(tj) == TJERR_WARNING;
-		if (!warned) {
-			s_consecutive_warnings = 0;
-			s_tolerate_logged = 0;
-		} else if (s_consecutive_warnings >= 60) {
-			if (!s_tolerate_logged) {
-				s_tolerate_logged = 1;
-				LOGW("mjpeg planar decode: every frame warns (%s); treating as benign padding",
-					tj3GetErrorStr(tj));
-			}
-		} else {
-			const char *msg = tj3GetErrorStr(tj);
-			s_consecutive_warnings++;
-			s_warning_drops++;
-			if (s_warning_drops <= 5 || !(s_warning_drops % 300))
-				LOGW("mjpeg planar decode dropped corrupt frame count=%u seq=%u bytes=%zu warn=%s",
-					s_warning_drops, in->sequence, in->actual_bytes, msg ? msg : "?");
+	if (UNLIKELY(tj3GetErrorCode(tj) == TJERR_WARNING)) {
+		if (!_mjpeg_planar_warning_tolerated(decoder, in, tj3GetErrorStr(tj)))
 			return UVC_ERROR_OTHER;
-		}
+	} else {
+		_mjpeg_planar_warning_clean(decoder, in);
 	}
 	return UVC_SUCCESS;
 }
