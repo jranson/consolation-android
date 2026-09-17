@@ -1534,6 +1534,15 @@ void UVCPreview::addPreviewFrame(uvc_frame_t *frame) {
 
 	pthread_mutex_lock(&preview_queue_mutex);
 	if (isRunning()) {
+		if (frameMode != REQUEST_MODE_H264) {
+			/* Latest-wins for live video: anything still queued is older than
+			 * this frame and would only be shown late.  Recycle it instead. */
+			while (!preview_frame_ring.empty()) {
+				uvc_frame_t *stale = preview_frame_ring.dequeue();
+				processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+				recycle_frame(stale);
+			}
+		}
 		uvc_frame_t *drop = preview_frame_ring.enqueue_drop_oldest_if_full(frame);
 		const uint64_t queued_backlog =
 			preview_frame_ring.size() > 0 ? preview_frame_ring.size() - 1 : 0;

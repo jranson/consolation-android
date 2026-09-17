@@ -36,10 +36,14 @@
 
 #pragma interface
 
-/** Preview FIFO depth; drop-oldest on overflow (see BoundedPointerRing). */
+/** Preview FIFO capacity; drop-oldest on overflow (see BoundedPointerRing).
+ * Only H264 uses the depth: encoded access units must not be skipped.  Every
+ * other mode enqueues latest-wins (addPreviewFrame drains older entries), so
+ * a renderer that falls behind never shows a frame older than the newest. */
 #define PREVIEW_QUEUE_MAX 4
-/** MJPEG decode input depth; keep tight to avoid adding frame latency. */
-#define MJPEG_DECODE_QUEUE_MAX 2
+/** MJPEG decode input depth: 1 = the decoder always picks up the newest frame,
+ * the ring never adds more than one frame of latency under load. */
+#define MJPEG_DECODE_QUEUE_MAX 1
 
 #define DEFAULT_PREVIEW_WIDTH 640
 #define DEFAULT_PREVIEW_HEIGHT 480
