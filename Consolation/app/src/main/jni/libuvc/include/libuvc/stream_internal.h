@@ -12,7 +12,14 @@ void _uvc_stream_try_acquire_outbuf(uvc_stream_handle_t *strmh);
 void _uvc_swap_buffers(uvc_stream_handle_t *strmh, const char *reason);
 
 int _uvc_mjpeg_payload_has_markers(uvc_stream_handle_t *strmh);
-void _uvc_mjpeg_note_payload_append(uvc_stream_handle_t *strmh);
+/* Returns 1 when the MJPEG frame under assembly now ends with EOI (FFD9). */
+int _uvc_mjpeg_note_payload_append(uvc_stream_handle_t *strmh);
+/* Publish the assembled MJPEG frame now (EOI seen) and ignore the rest of
+ * this FID.  Call right after a successful append that returned 1. */
+void _uvc_mjpeg_publish_on_eoi(uvc_stream_handle_t *strmh, const char *reason);
+/* 1 if this payload belongs to a frame already published on EOI: drop it. */
+int _uvc_mjpeg_payload_after_eoi(uvc_stream_handle_t *strmh, uint8_t header_info,
+		const uint8_t *data, size_t data_len);
 void _uvc_mjpeg_scan_reset(uvc_stream_handle_t *strmh);
 void _uvc_diag_mjpeg_drop(uvc_stream_handle_t *strmh, const char *reason);
 void _uvc_diag_mjpeg_publish(uvc_stream_handle_t *strmh, const char *reason);

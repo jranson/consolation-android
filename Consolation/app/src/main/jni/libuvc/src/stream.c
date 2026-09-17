@@ -1493,6 +1493,7 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 	memset(strmh->stalled_transfer_slots, 0, sizeof(strmh->stalled_transfer_slots));
 	memset(strmh->iso_transfer_pending, 0, sizeof(strmh->iso_transfer_pending));
 	strmh->diag_bfh_err_packets = 0;
+	strmh->mjpeg_eoi_skip_valid = 0;
 	_uvc_diag_iso_frame_reset(strmh);
 	_uvc_mjpeg_scan_reset(strmh);
 	strmh->iso_trace_count = 0;

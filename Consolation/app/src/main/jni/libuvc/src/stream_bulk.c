@@ -64,6 +64,11 @@ void _uvc_process_payload_bulk(uvc_stream_handle_t *strmh, const uint8_t *payloa
 				data_len);
 		}
 
+		/* Tail of a frame already published on its EOI marker: ignore. */
+		if (_uvc_mjpeg_payload_after_eoi(strmh, header_info,
+				payload + header_len, data_len))
+			return;
+
 		if ((strmh->fid != (header_info & UVC_STREAM_FID)) && strmh->got_bytes) {
 			/* The frame ID bit was flipped, but we have image data sitting
 				around from prior transfers. This means the camera didn't send
@@ -124,7 +129,10 @@ void _uvc_process_payload_bulk(uvc_stream_handle_t *strmh, const uint8_t *payloa
 		if (LIKELY(strmh->got_bytes + data_len <= strmh->size_buf)) {
 			memcpy(strmh->outbuf + strmh->got_bytes, payload + header_len, data_len);
 			strmh->got_bytes += data_len;
-			_uvc_mjpeg_note_payload_append(strmh);
+			if (_uvc_mjpeg_note_payload_append(strmh)) {
+				_uvc_mjpeg_publish_on_eoi(strmh, "bulk-eoi");
+				return;
+			}
 		} else {
 			strmh->bfh_err |= UVC_STREAM_ERR;
 		}

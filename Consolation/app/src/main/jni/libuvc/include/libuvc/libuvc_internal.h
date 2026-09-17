@@ -341,6 +341,11 @@ struct uvc_stream_handle {
   size_t mjpeg_scan_pos;
   uint8_t mjpeg_scan_found_sos;
   uint8_t mjpeg_scan_embedded_soi;
+  /* After an MJPEG frame is published on its EOI marker, remaining payloads
+   * with the same FID (padding, header-only EOF packets) are ignored until the
+   * FID flips, so they cannot start a bogus SOI-less frame. */
+  uint8_t mjpeg_eoi_skip_valid;
+  uint8_t mjpeg_eoi_skip_fid;
   size_t size_buf;	// XXX add for boundary check
   uint8_t *outbuf, *holdbuf;
   uint8_t *frame_pool[LIBUVC_FRAME_POOL_SLOTS];

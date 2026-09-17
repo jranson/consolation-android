@@ -321,6 +321,11 @@ static unsigned int _uvc_iso_host_packet_cap(uvc_stream_handle_t *strmh) {
 				 data_len);
 		 }
  
+		 /* Tail of a frame already published on its EOI marker: ignore. */
+		 if (_uvc_mjpeg_payload_after_eoi(strmh, header_info,
+		 		payload + header_len, data_len))
+			 return;
+
 		 if ((strmh->fid != (header_info & UVC_STREAM_FID)) && strmh->got_bytes) {
 			 _uvc_swap_buffers(strmh, "iso-fid");
 		 }
@@ -378,7 +383,10 @@ static unsigned int _uvc_iso_host_packet_cap(uvc_stream_handle_t *strmh) {
 #endif
 			 memcpy(strmh->outbuf + strmh->got_bytes, payload + header_len, data_len);
 			 strmh->got_bytes += data_len;
-			 _uvc_mjpeg_note_payload_append(strmh);
+			 if (_uvc_mjpeg_note_payload_append(strmh)) {
+				 _uvc_mjpeg_publish_on_eoi(strmh, "iso-eoi");
+				 return;
+			 }
 		 } else {
 			 strmh->diag_iso_overflow_count++;
 			 strmh->bfh_err |= UVC_STREAM_ERR;
