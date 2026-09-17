@@ -290,6 +290,15 @@ int UVCCamera::setPreviewDisplay(ANativeWindow *preview_window) {
 	RETURN(result, int);
 }
 
+int UVCCamera::setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_v,
+	float scale, float pan_x_ndc, float pan_y_ndc) {
+	int result = EXIT_FAILURE;
+	if (mPreview)
+		result = mPreview->setPreviewTransform(rotation_degrees, flip_h, flip_v,
+			scale, pan_x_ndc, pan_y_ndc);
+	return result;
+}
+
 int UVCCamera::setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format) {
 	ENTER();
 	int result = EXIT_FAILURE;

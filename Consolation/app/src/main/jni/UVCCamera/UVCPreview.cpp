@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <stdlib.h>
+#include <math.h>
 #include <linux/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -45,6 +46,7 @@
 #include "libuvc_internal.h"
 
 #include <sys/resource.h>
+#include <android/hardware_buffer.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <stdio.h>
@@ -332,7 +334,271 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	preview_iframecallback_fields.onFrame = nullptr;
 	memset(mjpeg_header_slots, 0, sizeof(mjpeg_header_slots));
 	memset(mjpeg_header_used, 0, sizeof(mjpeg_header_used));
+	{
+		static const float identity[9] = { 1, 0, 0,  0, 1, 0,  0, 0, 1 };
+		memcpy(mPreviewXform, identity, sizeof(mPreviewXform));
+	}
+	memset(mGpuPlanar, 0, sizeof(mGpuPlanar));
+	for (int i = 0; i < GPU_PLANAR_POOL_SZ; i++)
+		mGpuPlanar[i].fence_fd = -1;
+	mGpuPlanarNext = 0;
+	mGpuPlanarRenderFailures = 0;
+	{
+		/* Pick a GPU-sampleable buffer format for the zero-copy planar path.
+		 * R8 is the natural fit but many gralloc implementations reject it;
+		 * RGBA8 a quarter as wide (4 plane bytes per texel) is universal. */
+		/* CPU_READ_OFTEN is requested first on purpose: gralloc then gives a
+		 * cached CPU mapping (write-combined memory is very slow for libjpeg's
+		 * 8x8-block write pattern) and cleans the cache on unlock for the GPU. */
+		struct { uint32_t format; uint64_t usage; uint32_t bpt; const char *name; } cands[] = {
+			{ AHARDWAREBUFFER_FORMAT_R8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN
+				| AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 1, "R8 (cached)" },
+			{ AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN
+				| AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 4, "packed RGBA8 (cached)" },
+			{ AHARDWAREBUFFER_FORMAT_R8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_CPU_READ_RARELY
+				| AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 1, "R8" },
+			{ AHARDWAREBUFFER_FORMAT_R8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+			  1, "R8 (write-only)" },
+			{ AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_CPU_READ_RARELY
+				| AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 4, "packed RGBA8" },
+			{ AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+			  4, "packed RGBA8 (write-only)" },
+		};
+		mGpuPlanarEnabled = false;
+		mGpuPlanarFormat = 0;
+		mGpuPlanarUsage = 0;
+		mGpuPlanarBytesPerTexel = 1;
+		for (size_t c = 0; c < sizeof(cands) / sizeof(cands[0]); c++) {
+			AHardwareBuffer_Desc probe;
+			memset(&probe, 0, sizeof(probe));
+			probe.width = 64;
+			probe.height = 64;
+			probe.layers = 1;
+			probe.format = cands[c].format;
+			probe.usage = cands[c].usage;
+			if (AHardwareBuffer_isSupported(&probe)) {
+				mGpuPlanarEnabled = true;
+				mGpuPlanarFormat = cands[c].format;
+				mGpuPlanarUsage = cands[c].usage;
+				mGpuPlanarBytesPerTexel = cands[c].bpt;
+				LOGI("gpu-planar: zero-copy decode targets enabled using %s AHardwareBuffers",
+					cands[c].name);
+				break;
+			}
+		}
+		if (!mGpuPlanarEnabled)
+			LOGI("gpu-planar: no GPU-sampleable CPU-writable buffer format; using texture upload");
+	}
 	EXIT();
+}
+
+/* ---- zero-copy planar MJPEG targets ------------------------------------ */
+
+void UVCPreview::gpu_planar_free_slot(GpuPlanarFrame *g)
+{
+	for (int i = 0; i < 3; i++) {
+		if (g->ahb[i]) {
+			AHardwareBuffer_release((AHardwareBuffer *)g->ahb[i]);
+			g->ahb[i] = NULL;
+		}
+		g->ids[i] = 0;
+		g->w[i] = g->h[i] = g->stride[i] = 0;
+	}
+	if (g->fence_fd >= 0) {
+		close(g->fence_fd);
+		g->fence_fd = -1;
+	}
+}
+
+bool UVCPreview::gpu_planar_alloc_plane(GpuPlanarFrame *g, int i,
+	uint32_t width, uint32_t height)
+{
+	static std::atomic<uint64_t> s_next_id{1};
+	AHardwareBuffer_Desc desc;
+	AHardwareBuffer *buf = NULL;
+	const uint32_t bpt = mGpuPlanarBytesPerTexel;
+	memset(&desc, 0, sizeof(desc));
+	desc.width = (width + bpt - 1) / bpt;	/* texels; 4 plane bytes per RGBA texel */
+	desc.height = height;
+	desc.layers = 1;
+	desc.format = mGpuPlanarFormat;
+	desc.usage = mGpuPlanarUsage;
+	if (AHardwareBuffer_allocate(&desc, &buf) != 0 || !buf)
+		return false;
+	AHardwareBuffer_describe(buf, &desc);
+	g->ahb[i] = buf;
+	g->ids[i] = s_next_id.fetch_add(1, std::memory_order_relaxed);
+	g->w[i] = width;
+	g->h[i] = height;
+	g->stride[i] = desc.stride * bpt;	/* row pitch in bytes */
+	return true;
+}
+
+uvc_frame_t *UVCPreview::gpu_planar_get(const uint32_t widths[3], const uint32_t heights[3])
+{
+	GpuPlanarFrame *g = NULL;
+	pthread_mutex_lock(&pool_mutex);
+	/* Round-robin so the slot handed out is the one the GPU finished with
+	 * longest ago; its read fence is then almost always already signalled. */
+	for (int n = 0; n < GPU_PLANAR_POOL_SZ; n++) {
+		GpuPlanarFrame *c = &mGpuPlanar[(mGpuPlanarNext + n) % GPU_PLANAR_POOL_SZ];
+		if (!c->in_use) {
+			c->in_use = true;
+			mGpuPlanarNext = (unsigned)((c - mGpuPlanar) + 1) % GPU_PLANAR_POOL_SZ;
+			g = c;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&pool_mutex);
+	if (!g)
+		return NULL;
+
+	for (int i = 0; i < 3; i++) {
+		if (!widths[i]) {
+			if (g->ahb[i]) {
+				AHardwareBuffer_release((AHardwareBuffer *)g->ahb[i]);
+				g->ahb[i] = NULL;
+				g->ids[i] = 0;
+			}
+			g->w[i] = g->h[i] = g->stride[i] = 0;
+			continue;
+		}
+		if (g->ahb[i] && g->w[i] == widths[i] && g->h[i] == heights[i])
+			continue;
+		if (g->ahb[i]) {
+			AHardwareBuffer_release((AHardwareBuffer *)g->ahb[i]);
+			g->ahb[i] = NULL;
+		}
+		if (!gpu_planar_alloc_plane(g, i, widths[i], heights[i])) {
+			LOGW("gpu-planar: AHardwareBuffer_allocate %ux%u R8 failed", widths[i], heights[i]);
+			gpu_planar_put(&g->frame, -1);
+			return NULL;
+		}
+	}
+	return &g->frame;
+}
+
+void UVCPreview::gpu_planar_put(uvc_frame_t *frame, int fence_fd)
+{
+	if (!frame)
+		return;
+	GpuPlanarFrame *g = reinterpret_cast<GpuPlanarFrame *>(frame);	/* frame is first member */
+	pthread_mutex_lock(&pool_mutex);
+	if (g->fence_fd >= 0)
+		close(g->fence_fd);
+	g->fence_fd = fence_fd;
+	g->in_use = false;
+	pthread_mutex_unlock(&pool_mutex);
+}
+
+void UVCPreview::gpu_planar_release_all()
+{
+	pthread_mutex_lock(&pool_mutex);
+	for (int i = 0; i < GPU_PLANAR_POOL_SZ; i++) {
+		gpu_planar_free_slot(&mGpuPlanar[i]);
+		mGpuPlanar[i].in_use = false;
+	}
+	pthread_mutex_unlock(&pool_mutex);
+}
+
+/* Decode `frame` straight into a GPU planar target and queue it for the
+ * preview thread.  Returns true when the frame was handled (queued or
+ * dropped as corrupt); false means the zero-copy path is unavailable and the
+ * caller should fall back to the contiguous decode + texture upload. */
+bool UVCPreview::decode_mjpeg_to_gpu_planar(uvc_frame_t *frame)
+{
+	uint32_t widths[3], heights[3];
+	int subsamp = 0;
+	if (uvc_mjpeg_planar_layout(frame, widths, heights, &subsamp) != UVC_SUCCESS)
+		return false;	/* header problem: let the normal path report it */
+
+	uvc_frame_t *out = gpu_planar_get(widths, heights);
+	if (UNLIKELY(!out)) {
+		if (!mGpuPlanarEnabled)
+			return false;
+		/* Pool exhausted (should not happen with latest-wins): drop this one. */
+		processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	GpuPlanarFrame *g = reinterpret_cast<GpuPlanarFrame *>(out);
+	const int nplanes = widths[1] ? 3 : 1;
+	unsigned char *planes[3] = { NULL, NULL, NULL };
+	int strides[3] = { 0, 0, 0 };
+	int locked = 0;
+	bool ok = true;
+
+	/* The first lock waits on the fence from this slot's last GPU read; the
+	 * fence fd is consumed by the lock, so hand it over exactly once. */
+	int fence = g->fence_fd;
+	g->fence_fd = -1;
+	for (int i = 0; i < nplanes; i++) {
+		void *ptr = NULL;
+		if (AHardwareBuffer_lock((AHardwareBuffer *)g->ahb[i],
+				AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, i == 0 ? fence : -1,
+				NULL, &ptr) != 0 || !ptr) {
+			if (i == 0 && fence >= 0)
+				close(fence);
+			ok = false;
+			break;
+		}
+		planes[i] = (unsigned char *)ptr;
+		strides[i] = (int)g->stride[i];
+		locked = i + 1;
+	}
+
+	uvc_error_t result = UVC_ERROR_OTHER;
+	const uint64_t t_convert = processing_now_ns();
+	if (ok)
+		result = uvc_mjpeg2yuv_planes(frame, planes, strides);
+	for (int i = 0; i < locked; i++)
+		AHardwareBuffer_unlock((AHardwareBuffer *)g->ahb[i], NULL);
+	if (ok)
+		recordPreviewConversionTiming(processing_now_ns() - t_convert);
+
+	if (!ok) {
+		LOGW("gpu-planar: AHardwareBuffer_lock failed; falling back to texture upload");
+		mGpuPlanarEnabled = false;
+		gpu_planar_put(out, -1);
+		return false;
+	}
+	if (result != UVC_SUCCESS) {
+		/* Corrupt or undecodable: same policy as the upload path, frame dropped. */
+		processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+		gpu_planar_put(out, -1);
+		return true;
+	}
+
+	out->width = frame->width;
+	out->height = frame->height;
+	out->frame_format = UVC_FRAME_FORMAT_MJPEG_YUV_PLANAR;
+	out->data = NULL;
+	out->data_bytes = 0;
+	out->actual_bytes = 0;
+	out->library_owns_data = 0;
+	out->step = g->stride[0];
+	out->sequence = frame->sequence;
+	out->capture_time = frame->capture_time;
+	out->arrival_monotonic_ns = frame->arrival_monotonic_ns;
+	out->source = frame->source;
+	out->yuv_subsampling = subsamp;
+	out->integrity_sample_hash = 0;
+	out->yuv_hardware_buffer_bytes_per_texel = mGpuPlanarBytesPerTexel;
+	for (int i = 0; i < 3; i++) {
+		out->yuv_plane_widths[i] = widths[i];
+		out->yuv_plane_heights[i] = heights[i];
+		out->yuv_plane_strides[i] = g->stride[i];
+		out->yuv_plane_offsets[i] = 0;
+		out->yuv_hardware_buffers[i] = widths[i] ? g->ahb[i] : NULL;
+		out->yuv_hardware_buffer_ids[i] = widths[i] ? g->ids[i] : 0;
+	}
+	addPreviewFrame(out);
+	return true;
 }
 
 uvc_frame_t *UVCPreview::mjpeg_header_get() {
@@ -412,6 +678,7 @@ UVCPreview::~UVCPreview() {
 		delete mGpuPreviewRenderer;
 		mGpuPreviewRenderer = NULL;
 	}
+	gpu_planar_release_all();
 	if (mMjpegPreviewYuvFrame) {
 		uvc_free_frame(mMjpegPreviewYuvFrame);
 		mMjpegPreviewYuvFrame = NULL;
@@ -469,6 +736,10 @@ uvc_frame_t *UVCPreview::get_notification_frame() {
 }
 
 void UVCPreview::recycle_frame(uvc_frame_t *frame) {
+	if (UNLIKELY(gpu_planar_is(frame))) {
+		gpu_planar_put(frame, -1);
+		return;
+	}
 	if (UNLIKELY(frame && frame->data_bytes <= 1 && frame->library_owns_data)) {
 		pthread_mutex_lock(&pool_mutex);
 		if (LIKELY(mNotificationFramePool.size() < FRAME_POOL_SZ)) {
@@ -807,6 +1078,27 @@ int UVCPreview::setPreviewDisplay(ANativeWindow *preview_window) {
 	}
 	pthread_mutex_unlock(&preview_mutex);
 	RETURN(0, int);
+}
+
+int UVCPreview::setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_v,
+	float scale, float pan_x_ndc, float pan_y_ndc) {
+	/* Mirrors Compose graphicsLayer order: scale (incl. mirror) -> rotate ->
+	 * translate.  NDC has y up while the screen has y down, so a clockwise
+	 * on-screen rotation by r is (x, y) -> (x cos r + y sin r, -x sin r + y cos r). */
+	const double r = rotation_degrees * M_PI / 180.0;
+	const float c = (float)cos(r);
+	const float sn = (float)sin(r);
+	const float sx = scale * (flip_h ? -1.0f : 1.0f);
+	const float sy = scale * (flip_v ? -1.0f : 1.0f);
+	/* M = T * R * S, column-major for glUniformMatrix3fv. */
+	float m[9];
+	m[0] = c * sx;   m[1] = -sn * sx;  m[2] = 0.0f;	/* column 0 */
+	m[3] = sn * sy;  m[4] = c * sy;    m[5] = 0.0f;	/* column 1 */
+	m[6] = pan_x_ndc; m[7] = pan_y_ndc; m[8] = 1.0f;	/* column 2 */
+	pthread_mutex_lock(&preview_mutex);
+	memcpy(mPreviewXform, m, sizeof(mPreviewXform));
+	pthread_mutex_unlock(&preview_mutex);
+	return 0;
 }
 
 int UVCPreview::setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format) {
@@ -1347,6 +1639,31 @@ void UVCPreview::do_mjpeg_decode() {
 			continue;
 		}
 		debug_mjpeg_dump_maybe(frame);
+		{
+			/* A/B switch: adb shell setprop debug.consolation.gpu_planar 0|1
+			 * (polled every 60 frames; only honoured if the format probe passed). */
+			static uint32_t s_poll;
+			static int s_forced = -1;	/* -1 unset, 0 off, 1 on */
+			if ((s_poll++ % 60) == 0) {
+				char value[PROP_VALUE_MAX] = {};
+				if (__system_property_get("debug.consolation.gpu_planar", value) > 0 && value[0]) {
+					const int want = value[0] != '0';
+					if (want != s_forced) {
+						s_forced = want;
+						if (mGpuPlanarFormat) {
+							mGpuPlanarEnabled = want != 0;
+							mGpuPlanarRenderFailures = 0;
+							LOGW("gpu-planar: %s by property", want ? "enabled" : "disabled");
+						}
+					}
+				}
+			}
+		}
+		if (mGpuPlanarEnabled && decode_mjpeg_to_gpu_planar(frame)) {
+			uvc_frame_release(frame);
+			mjpeg_header_put(frame);
+			continue;
+		}
 		uvc_frame_t *decoded = get_frame(0);
 		if (LIKELY(decoded)) {
 			const uint64_t t_convert = processing_now_ns();
@@ -1397,11 +1714,17 @@ bool UVCPreview::renderFrameDirectToSurface(uvc_frame_t *frame,
 	ANativeWindow *target = *window;
 	if (LIKELY(target)) {
 		if (mGpuPreviewRenderer) {
+			mGpuPreviewRenderer->setTransform(mPreviewXform);
 			if (frame->frame_format != UVC_FRAME_FORMAT_MJPEG
 					&& mGpuPreviewRenderer->render(frame, target, frame_ready_ns)) {
 				rendered = true;
 				pthread_mutex_unlock(window_mutex);
 				return rendered;
+			}
+			if (gpu_planar_is(frame)) {
+				/* Planes live only in GPU memory: nothing for the CPU path. */
+				pthread_mutex_unlock(window_mutex);
+				return false;
 			}
 			if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG) {
 				if (UNLIKELY(!mMjpegPreviewYuvFrame))
@@ -1743,13 +2066,47 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 							frame = NULL;
 							continue;
 						}
-						if (renderFrameDirectToSurface(frame, &mPreviewWindow,
-								&preview_mutex, &frame_ready_ns, &surface_wait_ns)
-								&& frame_ready_ns && frame->arrival_monotonic_ns) {
+						const uint64_t t_render = processing_now_ns();
+						const bool rendered = renderFrameDirectToSurface(frame,
+							&mPreviewWindow, &preview_mutex, &frame_ready_ns,
+							&surface_wait_ns);
+						{
+							/* Per-path render cost (upload+draw+swap), logged every
+							 * 600 frames so the zero-copy path can be A/B'd on device. */
+							static uint64_t s_sum[2], s_max[2];
+							static uint32_t s_n[2];
+							const int path = gpu_planar_is(frame) ? 1 : 0;
+							const uint64_t dt = processing_now_ns() - t_render;
+							s_sum[path] += dt;
+							if (dt > s_max[path]) s_max[path] = dt;
+							if (++s_n[path] == 600) {
+								LOGI("planar-render: path=%s avg_us=%llu max_us=%llu over 600 frames",
+									path ? "zero-copy" : "upload",
+									(unsigned long long)(s_sum[path] / 600 / 1000),
+									(unsigned long long)(s_max[path] / 1000));
+								s_sum[path] = 0; s_max[path] = 0; s_n[path] = 0;
+							}
+						}
+						if (rendered && frame_ready_ns && frame->arrival_monotonic_ns) {
 							recordEndToEndLatencyTiming(frame->arrival_monotonic_ns,
 								frame_ready_ns);
 						}
-						recycle_frame(frame);
+						if (gpu_planar_is(frame)) {
+							if (rendered) {
+								mGpuPlanarRenderFailures = 0;
+								gpu_planar_put(frame, mGpuPreviewRenderer
+									? mGpuPreviewRenderer->takeRenderFenceFd() : -1);
+							} else {
+								gpu_planar_put(frame, -1);
+								if (++mGpuPlanarRenderFailures >= 3 && mGpuPlanarEnabled) {
+									LOGW("gpu-planar: render failed %u times; falling back to texture upload",
+										mGpuPlanarRenderFailures);
+									mGpuPlanarEnabled = false;
+								}
+							}
+						} else {
+							recycle_frame(frame);
+						}
 						frame = NULL;
 						continue;
 					}

@@ -192,6 +192,7 @@ public:
 	char *getDescriptions();
 	int setPreviewSize(int width, int height, int min_fps, int max_fps, int mode, float bandwidth = DEFAULT_BANDWIDTH);
 	int setPreviewDisplay(ANativeWindow *preview_window);
+	int setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_v, float scale, float pan_x_ndc, float pan_y_ndc);
 	int setPreviewFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int startPreview();

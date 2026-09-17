@@ -481,6 +481,17 @@ public class UVCCamera {
     	nativeSetPreviewDisplay(mNativePtr, surface);
     }
 
+	/**
+	 * Rotation (0/90/180/270), mirror flags, zoom scale and pan (in NDC units,
+	 * -1..1 across the surface) applied by the native GPU renderer.
+	 */
+	public void setPreviewTransform(final int rotationDegrees, final boolean flipH,
+			final boolean flipV, final float scale, final float panXNdc, final float panYNdc) {
+		if (mNativePtr != 0) {
+			nativeSetPreviewTransform(mNativePtr, rotationDegrees, flipH, flipV, scale, panXNdc, panYNdc);
+		}
+	}
+
     /**
      * set frame callback
      * @param callback
@@ -1151,6 +1162,8 @@ public class UVCCamera {
     private static final native int nativeStartPreview(final long id_camera);
     private static final native int nativeStopPreview(final long id_camera);
     private static final native int nativeSetPreviewDisplay(final long id_camera, final Surface surface);
+	private static final native int nativeSetPreviewTransform(final long id_camera, final int rotation,
+		final boolean flipH, final boolean flipV, final float scale, final float panX, final float panY);
     private static final native int nativeSetPreviewFrameCallback(final long mNativePtr, final IFrameCallback callback, final int pixelFormat);
     private static final native int nativeSetFrameCallback(final long mNativePtr, final IFrameCallback callback, final int pixelFormat);
 	private static final native long[] nativeGetAndResetProcessingStats(final long mNativePtr);

@@ -101,6 +101,35 @@ private:
 	uvc_frame_t *mjpeg_header_get();
 	void mjpeg_header_put_locked(uvc_frame_t *header);
 	void mjpeg_header_put(uvc_frame_t *header);
+	/** Planar MJPEG decode targets in GPU-sampleable memory: one R8
+	 * AHardwareBuffer per plane, bound by the renderer as EGLImages, so a
+	 * decoded frame reaches the GPU with no upload copy.  Depth: one queued
+	 * (latest-wins) + one rendering + one decoding + one of slack. */
+#define GPU_PLANAR_POOL_SZ 4
+	struct GpuPlanarFrame {
+		uvc_frame_t frame;
+		void *ahb[3];
+		uint64_t ids[3];
+		uint32_t w[3], h[3], stride[3];
+		int fence_fd;		/**< GPU read fence from the last render, -1 = none */
+		bool in_use;
+	};
+	GpuPlanarFrame mGpuPlanar[GPU_PLANAR_POOL_SZ];
+	unsigned mGpuPlanarNext;
+	unsigned mGpuPlanarRenderFailures;
+	volatile bool mGpuPlanarEnabled;
+	uint32_t mGpuPlanarFormat;		/**< AHARDWAREBUFFER_FORMAT_* chosen by the probe */
+	uint64_t mGpuPlanarUsage;
+	uint32_t mGpuPlanarBytesPerTexel;	/**< 1 for R8, 4 for packed RGBA8 */
+	static void gpu_planar_free_slot(GpuPlanarFrame *g);
+	bool gpu_planar_alloc_plane(GpuPlanarFrame *g, int i, uint32_t width, uint32_t height);
+	uvc_frame_t *gpu_planar_get(const uint32_t widths[3], const uint32_t heights[3]);
+	void gpu_planar_put(uvc_frame_t *frame, int fence_fd);
+	void gpu_planar_release_all();
+	static bool gpu_planar_is(const uvc_frame_t *frame) {
+		return frame && frame->yuv_hardware_buffers[0] != NULL;
+	}
+	bool decode_mjpeg_to_gpu_planar(uvc_frame_t *frame);
 	int previewFormat;
 	size_t previewBytes;
 //
@@ -113,6 +142,7 @@ private:
 	pthread_cond_t capture_sync;
 	uvc_frame_t *captureQueu;			// keep latest frame
 	UVCGpuPreviewRenderer *mGpuPreviewRenderer;
+	float mPreviewXform[9];		/**< guarded by preview_mutex */
 	uvc_frame_t *mMjpegPreviewYuvFrame;
 	jobject mFrameCallbackObj;
 	convFunc_t mFrameCallbackFunc;
@@ -229,6 +259,11 @@ public:
 	inline const bool isRunning() const;
 	int setPreviewSize(int width, int height, int min_fps, int max_fps, int mode, float bandwidth = 1.0f);
 	int setPreviewDisplay(ANativeWindow *preview_window);
+	/** Rotation (0/90/180/270, clockwise on screen), mirror flags, zoom scale
+	 * and pan in NDC units, applied by the GPU renderer.  Lets the preview live
+	 * in a SurfaceView, which cannot be rotated or mirrored by the View system. */
+	int setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_v,
+		float scale, float pan_x_ndc, float pan_y_ndc);
 	int setPreviewFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int startPreview();

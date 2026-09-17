@@ -723,16 +723,12 @@ fail:
 	return UVC_ERROR_OTHER+1;
 }
 
-uvc_error_t uvc_mjpeg2yuv_planar(uvc_frame_t *in, uvc_frame_t *out) {
+uvc_error_t uvc_mjpeg_planar_layout(uvc_frame_t *in, uint32_t widths[3],
+		uint32_t heights[3], int *subsamp_out) {
 	struct mjpeg_decoder_ctx *decoder;
 	tjhandle tj;
 	int subsamp;
-	int strides[3] = { 0, 0, 0 };
-	unsigned char *planes[3] = { NULL, NULL, NULL };
-	size_t offsets[3] = { 0, 0, 0 };
-	size_t total_bytes = 0;
 
-	out->actual_bytes = 0;
 	if (UNLIKELY(in->frame_format != UVC_FRAME_FORMAT_MJPEG))
 		return UVC_ERROR_INVALID_PARAM;
 	if (UNLIKELY(!in->data || !in->actual_bytes || !in->width || !in->height))
@@ -757,45 +753,38 @@ uvc_error_t uvc_mjpeg2yuv_planar(uvc_frame_t *in, uvc_frame_t *out) {
 		return UVC_ERROR_INVALID_PARAM;
 
 	for (int i = 0; i < 3; i++) {
-		const int plane_width = tj3YUVPlaneWidth(i, (int)in->width, subsamp);
-		const int plane_height = tj3YUVPlaneHeight(i, (int)in->height, subsamp);
-		size_t plane_size;
 		if (i > 0 && subsamp == TJSAMP_GRAY) {
-			out->yuv_plane_widths[i] = 0;
-			out->yuv_plane_heights[i] = 0;
-			out->yuv_plane_offsets[i] = 0;
-			out->yuv_plane_strides[i] = 0;
+			widths[i] = 0;
+			heights[i] = 0;
 			continue;
 		}
-		if (UNLIKELY(plane_width <= 0 || plane_height <= 0))
+		const int pw = tj3YUVPlaneWidth(i, (int)in->width, subsamp);
+		const int ph = tj3YUVPlaneHeight(i, (int)in->height, subsamp);
+		if (UNLIKELY(pw <= 0 || ph <= 0))
 			return UVC_ERROR_INVALID_PARAM;
-		strides[i] = plane_width;
-		plane_size = tj3YUVPlaneSize(i, (int)in->width, strides[i],
-			(int)in->height, subsamp);
-		if (UNLIKELY(!plane_size || total_bytes > (size_t)-1 - plane_size))
-			return UVC_ERROR_INVALID_PARAM;
-		offsets[i] = total_bytes;
-		total_bytes += plane_size;
-		out->yuv_plane_widths[i] = (uint32_t)plane_width;
-		out->yuv_plane_heights[i] = (uint32_t)plane_height;
-		out->yuv_plane_offsets[i] = offsets[i];
-		out->yuv_plane_strides[i] = (size_t)strides[i];
+		widths[i] = (uint32_t)pw;
+		heights[i] = (uint32_t)ph;
 	}
+	if (subsamp_out)
+		*subsamp_out = subsamp;
+	return UVC_SUCCESS;
+}
 
-	if (UNLIKELY(uvc_ensure_frame_size(out, total_bytes) < 0))
+uvc_error_t uvc_mjpeg2yuv_planes(uvc_frame_t *in, unsigned char *planes[3],
+		const int strides[3]) {
+	struct mjpeg_decoder_ctx *decoder;
+	tjhandle tj;
+
+	decoder = _mjpeg_decoder_get();
+	if (UNLIKELY(!decoder))
 		return UVC_ERROR_NO_MEM;
-
-	for (int i = 0; i < 3; i++) {
-		if (i > 0 && subsamp == TJSAMP_GRAY) {
-			planes[i] = NULL;
-			continue;
-		}
-		planes[i] = (unsigned char *)out->data + offsets[i];
-	}
+	tj = _mjpeg_tj_decoder_get(decoder);
+	if (UNLIKELY(!tj))
+		return UVC_ERROR_NO_MEM;
 
 	if (UNLIKELY(tj3DecompressToYUVPlanes8(tj,
 			(const unsigned char *)in->data, in->actual_bytes,
-			planes, strides) != 0)) {
+			planes, (int *)strides) != 0)) {
 		UVC_DIAG_LOGI("mjpeg-diag:planar-decode-fail seq=%u bytes=%zu err=%s",
 			in->sequence,
 			in->actual_bytes,
@@ -834,6 +823,54 @@ uvc_error_t uvc_mjpeg2yuv_planar(uvc_frame_t *in, uvc_frame_t *out) {
 			return UVC_ERROR_OTHER;
 		}
 	}
+	return UVC_SUCCESS;
+}
+
+uvc_error_t uvc_mjpeg2yuv_planar(uvc_frame_t *in, uvc_frame_t *out) {
+	uint32_t widths[3], heights[3];
+	int subsamp = 0;
+	int strides[3] = { 0, 0, 0 };
+	unsigned char *planes[3] = { NULL, NULL, NULL };
+	size_t offsets[3] = { 0, 0, 0 };
+	size_t total_bytes = 0;
+	uvc_error_t err;
+
+	out->actual_bytes = 0;
+	err = uvc_mjpeg_planar_layout(in, widths, heights, &subsamp);
+	if (UNLIKELY(err != UVC_SUCCESS))
+		return err;
+
+	for (int i = 0; i < 3; i++) {
+		size_t plane_size;
+		if (!widths[i]) {
+			out->yuv_plane_widths[i] = 0;
+			out->yuv_plane_heights[i] = 0;
+			out->yuv_plane_offsets[i] = 0;
+			out->yuv_plane_strides[i] = 0;
+			continue;
+		}
+		strides[i] = (int)widths[i];
+		plane_size = tj3YUVPlaneSize(i, (int)in->width, strides[i],
+			(int)in->height, subsamp);
+		if (UNLIKELY(!plane_size || total_bytes > (size_t)-1 - plane_size))
+			return UVC_ERROR_INVALID_PARAM;
+		offsets[i] = total_bytes;
+		total_bytes += plane_size;
+		out->yuv_plane_widths[i] = widths[i];
+		out->yuv_plane_heights[i] = heights[i];
+		out->yuv_plane_offsets[i] = offsets[i];
+		out->yuv_plane_strides[i] = (size_t)strides[i];
+	}
+
+	if (UNLIKELY(uvc_ensure_frame_size(out, total_bytes) < 0))
+		return UVC_ERROR_NO_MEM;
+
+	for (int i = 0; i < 3; i++)
+		planes[i] = widths[i] ? (unsigned char *)out->data + offsets[i] : NULL;
+
+	err = uvc_mjpeg2yuv_planes(in, planes, strides);
+	if (UNLIKELY(err != UVC_SUCCESS))
+		return err;
 
 	out->width = in->width;
 	out->height = in->height;

@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 namespace {
 
@@ -24,10 +25,11 @@ static const char *vertex_shader_src =
 	"#version 300 es\n"
 	"layout(location=0) in vec2 aPos;\n"
 	"layout(location=1) in vec2 aTex;\n"
+	"uniform mat3 uXform;\n"
 	"out vec2 vTex;\n"
 	"void main() {\n"
 	"  vTex = aTex;\n"
-	"  gl_Position = vec4(aPos, 0.0, 1.0);\n"
+	"  gl_Position = vec4((uXform * vec3(aPos, 1.0)).xy, 0.0, 1.0);\n"
 	"}\n";
 
 static const char *yuyv_fragment_shader_src =
@@ -150,6 +152,47 @@ static const char *mjpeg_planar_fragment_shader_src =
 	"  fragColor = vec4(clamp(yuvToRgb(yy, uu, vv), 0.0, 1.0), 1.0);\n"
 	"}\n";
 
+/* Same as the planar shader, but each plane lives in an RGBA8 texture a
+ * quarter as wide: byte x of a row is component (x & 3) of texel x >> 2. */
+static const char *mjpeg_planar_packed_fragment_shader_src =
+	"#version 300 es\n"
+	"precision highp float;\n"
+	"precision highp int;\n"
+	"uniform sampler2D uY;\n"
+	"uniform sampler2D uU;\n"
+	"uniform sampler2D uV;\n"
+	"uniform int uWidth;\n"
+	"uniform int uHeight;\n"
+	"uniform int uChromaWidth;\n"
+	"uniform int uChromaHeight;\n"
+	"uniform int uGray;\n"
+	"in vec2 vTex;\n"
+	"out vec4 fragColor;\n"
+	"float planeByte(sampler2D s, int x, int y) {\n"
+	"  vec4 v = texelFetch(s, ivec2(x >> 2, y), 0);\n"
+	"  int c = x & 3;\n"
+	"  return c == 0 ? v.r : (c == 1 ? v.g : (c == 2 ? v.b : v.a));\n"
+	"}\n"
+	"vec3 yuvToRgb(float y, float u, float v) {\n"
+	"  u -= 0.5;\n"
+	"  v -= 0.5;\n"
+	"  return vec3(y + 1.402 * v, y - 0.344136 * u - 0.714136 * v, y + 1.772 * u);\n"
+	"}\n"
+	"void main() {\n"
+	"  int x = clamp(int(vTex.x * float(uWidth)), 0, uWidth - 1);\n"
+	"  int yrow = clamp(int(vTex.y * float(uHeight)), 0, uHeight - 1);\n"
+	"  float yy = planeByte(uY, x, yrow);\n"
+	"  if (uGray != 0) {\n"
+	"    fragColor = vec4(yy, yy, yy, 1.0);\n"
+	"    return;\n"
+	"  }\n"
+	"  int cx = clamp((x * uChromaWidth) / uWidth, 0, uChromaWidth - 1);\n"
+	"  int cy = clamp((yrow * uChromaHeight) / uHeight, 0, uChromaHeight - 1);\n"
+	"  float uu = planeByte(uU, cx, cy);\n"
+	"  float vv = planeByte(uV, cx, cy);\n"
+	"  fragColor = vec4(clamp(yuvToRgb(yy, uu, vv), 0.0, 1.0), 1.0);\n"
+	"}\n";
+
 static const char *bgr_fragment_shader_src =
 	"#version 300 es\n"
 	"precision highp float;\n"
@@ -262,6 +305,7 @@ enum ProgramKind {
 	PROGRAM_BGR,
 	PROGRAM_P010,
 	PROGRAM_HARDWARE_LINEAR,
+	PROGRAM_MJPEG_PLANAR_PACKED,
 	PROGRAM_COUNT
 };
 
@@ -328,7 +372,10 @@ struct UVCGpuPreviewRenderer::Impl {
 		GLint width = -1, height = -1;
 		GLint chromaWidth = -1, chromaHeight = -1, gray = -1, uyvy = -1;
 		GLint storageWidth = -1, format = -1;
+		GLint xform = -1;
 	};
+	/* Identity until UVCPreview pushes rotation/flip/zoom/pan (column-major). */
+	float xform[9] = { 1, 0, 0,  0, 1, 0,  0, 0, 1 };
 
 	EGLDisplay display = EGL_NO_DISPLAY;
 	EGLContext context = EGL_NO_CONTEXT;
@@ -357,6 +404,21 @@ struct UVCGpuPreviewRenderer::Impl {
 	PFNEGLCREATEIMAGEKHRPROC pCreateImage = nullptr;
 	PFNEGLDESTROYIMAGEKHRPROC pDestroyImage = nullptr;
 	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC pImageTargetTexture = nullptr;
+	PFNEGLCREATESYNCKHRPROC pCreateSync = nullptr;
+	PFNEGLDESTROYSYNCKHRPROC pDestroySync = nullptr;
+	PFNEGLDUPNATIVEFENCEFDANDROIDPROC pDupNativeFenceFD = nullptr;
+
+	/* EGLImage + texture per decoder plane buffer, keyed by the frame's
+	 * allocation id (pointers get recycled; ids never do). */
+	struct PlaneImage {
+		uint64_t id = 0;
+		EGLImageKHR image = EGL_NO_IMAGE_KHR;
+		GLuint tex = 0;
+	};
+	static const int PLANE_IMAGE_CACHE = 16;
+	PlaneImage planeImages[PLANE_IMAGE_CACHE];
+	int planeImageCount = 0;
+	int lastRenderFenceFd = -1;
 
 	bool ensureEgl(ANativeWindow *target);
 	bool ensureSurface(ANativeWindow *target);
@@ -365,8 +427,12 @@ struct UVCGpuPreviewRenderer::Impl {
 	GLuint program(ProgramKind kind);
 	void setupGeometry();
 	void refreshSurfaceSize(bool force);
-	void drawQuad();
+	void drawQuad(ProgramKind kind);
 	bool drawHardwareBuffer(uvc_frame_t *frame);
+	bool drawPlanarHardware(uvc_frame_t *frame);
+	GLuint planeTextureFor(void *ahb, uint64_t id);
+	void destroyPlaneImages();
+	void captureRenderFence();
 	bool uploadAndDraw(uvc_frame_t *frame);
 	void resetTextureStorage();
 	bool uploadTexture(int unit, GLenum internal, GLenum format, GLenum type,
@@ -388,10 +454,28 @@ UVCGpuPreviewRenderer::~UVCGpuPreviewRenderer()
 bool UVCGpuPreviewRenderer::render(uvc_frame_t *frame, ANativeWindow *window,
 	uint64_t *frame_ready_ns)
 {
-	if (!impl || !frame || !window || !frame->data)
+	if (!impl || !frame || !window)
+		return false;
+	if (!frame->data && !frame->yuv_hardware_buffers[0])
 		return false;
 	if (!impl->ensureEgl(window) || !impl->ensureSurface(window))
 		return false;
+	if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG_YUV_PLANAR
+			&& frame->yuv_hardware_buffers[0]) {
+		/* Zero-copy path: planes are already in GPU-sampleable memory. */
+		if (!impl->drawPlanarHardware(frame))
+			return false;
+		const uint64_t ready_ns = now_ns();
+		if (eglSwapBuffers(impl->display, impl->surface) != EGL_TRUE) {
+			LOGW("gpu-preview: eglSwapBuffers failed err=0x%x", eglGetError());
+			impl->destroySurface();
+			return false;
+		}
+		impl->captureRenderFence();
+		if (frame_ready_ns)
+			*frame_ready_ns = ready_ns;
+		return true;
+	}
 	if (frame->library_hardware_buffer) {
 		if (impl->drawHardwareBuffer(frame)) {
 			const uint64_t ready_ns = now_ns();
@@ -421,6 +505,21 @@ bool UVCGpuPreviewRenderer::render(uvc_frame_t *frame, ANativeWindow *window,
 	if (frame_ready_ns)
 		*frame_ready_ns = ready_ns;
 	return true;
+}
+
+int UVCGpuPreviewRenderer::takeRenderFenceFd()
+{
+	if (!impl)
+		return -1;
+	const int fd = impl->lastRenderFenceFd;
+	impl->lastRenderFenceFd = -1;
+	return fd;
+}
+
+void UVCGpuPreviewRenderer::setTransform(const float m[9])
+{
+	if (impl && m)
+		memcpy(impl->xform, m, sizeof(impl->xform));
 }
 
 void UVCGpuPreviewRenderer::resetSurface()
@@ -490,6 +589,10 @@ bool UVCGpuPreviewRenderer::Impl::ensureEgl(ANativeWindow *target)
 	pDestroyImage = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
 	pImageTargetTexture = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)
 		eglGetProcAddress("glEGLImageTargetTexture2DOES");
+	pCreateSync = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
+	pDestroySync = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+	pDupNativeFenceFD = (PFNEGLDUPNATIVEFENCEFDANDROIDPROC)
+		eglGetProcAddress("eglDupNativeFenceFDANDROID");
 
 	(void)target;
 	return true;
@@ -539,6 +642,11 @@ void UVCGpuPreviewRenderer::Impl::destroySurface()
 	if (hardwareTexture) {
 		glDeleteTextures(1, &hardwareTexture);
 		hardwareTexture = 0;
+	}
+	destroyPlaneImages();
+	if (lastRenderFenceFd >= 0) {
+		close(lastRenderFenceFd);
+		lastRenderFenceFd = -1;
 	}
 	if (vao) {
 		glDeleteVertexArrays(1, &vao);
@@ -608,6 +716,9 @@ GLuint UVCGpuPreviewRenderer::Impl::program(ProgramKind kind)
 	case PROGRAM_HARDWARE_LINEAR:
 		src = hardware_linear_fragment_shader_src;
 		break;
+	case PROGRAM_MJPEG_PLANAR_PACKED:
+		src = mjpeg_planar_packed_fragment_shader_src;
+		break;
 	default:
 		return 0;
 	}
@@ -621,11 +732,11 @@ GLuint UVCGpuPreviewRenderer::Impl::program(ProgramKind kind)
 	 * so set them once here. */
 	Uniforms &u = uniforms[kind];
 	static const char *tex0_names[PROGRAM_COUNT] = {
-		"uPacked", "uY", "uY", "uY", "uBgr", "uY16", "uStorage" };
+		"uPacked", "uY", "uY", "uY", "uBgr", "uY16", "uStorage", "uY" };
 	static const char *tex1_names[PROGRAM_COUNT] = {
-		nullptr, "uUV", "uU", "uU", nullptr, "uUV16", nullptr };
+		nullptr, "uUV", "uU", "uU", nullptr, "uUV16", nullptr, "uU" };
 	static const char *tex2_names[PROGRAM_COUNT] = {
-		nullptr, nullptr, "uV", "uV", nullptr, nullptr, nullptr };
+		nullptr, nullptr, "uV", "uV", nullptr, nullptr, nullptr, "uV" };
 	u.tex0 = tex0_names[kind] ? glGetUniformLocation(prog, tex0_names[kind]) : -1;
 	u.tex1 = tex1_names[kind] ? glGetUniformLocation(prog, tex1_names[kind]) : -1;
 	u.tex2 = tex2_names[kind] ? glGetUniformLocation(prog, tex2_names[kind]) : -1;
@@ -637,6 +748,7 @@ GLuint UVCGpuPreviewRenderer::Impl::program(ProgramKind kind)
 	u.uyvy = glGetUniformLocation(prog, "uUyvy");
 	u.storageWidth = glGetUniformLocation(prog, "uStorageWidth");
 	u.format = glGetUniformLocation(prog, "uFormat");
+	u.xform = glGetUniformLocation(prog, "uXform");
 	glUseProgram(prog);
 	glUniform1i(u.tex0, 0);
 	glUniform1i(u.tex1, 1);
@@ -681,10 +793,11 @@ void UVCGpuPreviewRenderer::Impl::refreshSurfaceSize(bool force)
 	surface_height = sh;
 }
 
-void UVCGpuPreviewRenderer::Impl::drawQuad()
+void UVCGpuPreviewRenderer::Impl::drawQuad(ProgramKind kind)
 {
 	refreshSurfaceSize(false);
 	glViewport(0, 0, surface_width, surface_height);
+	glUniformMatrix3fv(uniforms[kind].xform, 1, GL_FALSE, xform);
 	glBindVertexArray(vao);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	glBindVertexArray(0);
@@ -751,7 +864,7 @@ bool UVCGpuPreviewRenderer::Impl::drawHardwareBuffer(uvc_frame_t *frame)
 		glUniform1i(u.storageWidth, (int)desc.width);
 		glUniform1i(u.format, (int)frame->frame_format);
 
-		drawQuad();
+		drawQuad(PROGRAM_HARDWARE_LINEAR);
 
 		const GLenum err = glGetError();
 		if (err != GL_NO_ERROR) {
@@ -768,6 +881,129 @@ bool UVCGpuPreviewRenderer::Impl::drawHardwareBuffer(uvc_frame_t *frame)
 	if (!ok)
 		destroySurface();
 	return ok;
+}
+
+void UVCGpuPreviewRenderer::Impl::destroyPlaneImages()
+{
+	for (int i = 0; i < planeImageCount; i++) {
+		if (planeImages[i].tex)
+			glDeleteTextures(1, &planeImages[i].tex);
+		if (planeImages[i].image != EGL_NO_IMAGE_KHR && pDestroyImage)
+			pDestroyImage(display, planeImages[i].image);
+		planeImages[i] = PlaneImage();
+	}
+	planeImageCount = 0;
+}
+
+GLuint UVCGpuPreviewRenderer::Impl::planeTextureFor(void *ahb, uint64_t id)
+{
+	for (int i = 0; i < planeImageCount; i++)
+		if (planeImages[i].id == id)
+			return planeImages[i].tex;
+	if (!pGetNativeClientBuffer || !pCreateImage || !pImageTargetTexture)
+		return 0;
+	if (planeImageCount == PLANE_IMAGE_CACHE) {
+		/* Evict the oldest entry; the decoder pool is far smaller than this. */
+		if (planeImages[0].tex)
+			glDeleteTextures(1, &planeImages[0].tex);
+		if (planeImages[0].image != EGL_NO_IMAGE_KHR && pDestroyImage)
+			pDestroyImage(display, planeImages[0].image);
+		memmove(&planeImages[0], &planeImages[1],
+			sizeof(PlaneImage) * (PLANE_IMAGE_CACHE - 1));
+		planeImages[PLANE_IMAGE_CACHE - 1] = PlaneImage();
+		planeImageCount--;
+	}
+	EGLClientBuffer clientBuffer = pGetNativeClientBuffer((AHardwareBuffer *)ahb);
+	if (!clientBuffer)
+		return 0;
+	EGLImageKHR image = pCreateImage(display, EGL_NO_CONTEXT,
+		EGL_NATIVE_BUFFER_ANDROID, clientBuffer, NULL);
+	if (image == EGL_NO_IMAGE_KHR) {
+		LOGW("gpu-preview: eglCreateImageKHR(plane AHB) failed err=0x%x", eglGetError());
+		return 0;
+	}
+	GLuint tex = 0;
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	pImageTargetTexture(GL_TEXTURE_2D, image);
+	if (glGetError() != GL_NO_ERROR) {
+		glDeleteTextures(1, &tex);
+		if (pDestroyImage)
+			pDestroyImage(display, image);
+		LOGW("gpu-preview: glEGLImageTargetTexture2DOES(plane) failed");
+		return 0;
+	}
+	PlaneImage &e = planeImages[planeImageCount++];
+	e.id = id;
+	e.image = image;
+	e.tex = tex;
+	return tex;
+}
+
+/* Record a native fence for the commands just issued so the decoder can wait
+ * for the GPU to finish reading these planes before overwriting them. */
+void UVCGpuPreviewRenderer::Impl::captureRenderFence()
+{
+	if (lastRenderFenceFd >= 0) {
+		close(lastRenderFenceFd);
+		lastRenderFenceFd = -1;
+	}
+	if (!pCreateSync || !pDupNativeFenceFD || !pDestroySync) {
+		glFinish();	/* no native fences: fall back to a full GPU wait */
+		return;
+	}
+	EGLSyncKHR sync = pCreateSync(display, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+	if (sync == EGL_NO_SYNC_KHR) {
+		glFinish();
+		return;
+	}
+	glFlush();	/* the fence fd only becomes valid once the sync is flushed */
+	lastRenderFenceFd = pDupNativeFenceFD(display, sync);
+	pDestroySync(display, sync);
+	if (lastRenderFenceFd < 0) {
+		lastRenderFenceFd = -1;
+		glFinish();
+	}
+}
+
+bool UVCGpuPreviewRenderer::Impl::drawPlanarHardware(uvc_frame_t *frame)
+{
+	const bool gray = frame->yuv_hardware_buffers[1] == nullptr;
+	const int width = (int)frame->width;
+	const int height = (int)frame->height;
+	if (width <= 0 || height <= 0)
+		return false;
+	const ProgramKind kind = frame->yuv_hardware_buffer_bytes_per_texel == 4
+		? PROGRAM_MJPEG_PLANAR_PACKED : PROGRAM_MJPEG_PLANAR;
+	GLuint prog = program(kind);
+	if (!prog)
+		return false;
+	for (int i = 0; i < (gray ? 1 : 3); i++) {
+		GLuint tex = planeTextureFor(frame->yuv_hardware_buffers[i],
+			frame->yuv_hardware_buffer_ids[i]);
+		if (!tex)
+			return false;
+		glActiveTexture(GL_TEXTURE0 + i);
+		glBindTexture(GL_TEXTURE_2D, tex);
+	}
+	const Uniforms &u = uniforms[kind];
+	glUseProgram(prog);
+	glUniform1i(u.width, width);
+	glUniform1i(u.height, height);
+	glUniform1i(u.chromaWidth, gray ? 1 : (int)frame->yuv_plane_widths[1]);
+	glUniform1i(u.chromaHeight, gray ? 1 : (int)frame->yuv_plane_heights[1]);
+	glUniform1i(u.gray, gray ? 1 : 0);
+	drawQuad(kind);
+	const GLenum err = glGetError();
+	if (err != GL_NO_ERROR) {
+		LOGW("gpu-preview: planar AHB draw failed glerr=0x%x", err);
+		return false;
+	}
+	return true;
 }
 
 void UVCGpuPreviewRenderer::Impl::resetTextureStorage()
@@ -958,7 +1194,7 @@ bool UVCGpuPreviewRenderer::Impl::uploadAndDraw(uvc_frame_t *frame)
 		return false;
 	}
 
-	drawQuad();
+	drawQuad(kind);
 
 	const GLenum err = glGetError();
 	if (err != GL_NO_ERROR) {

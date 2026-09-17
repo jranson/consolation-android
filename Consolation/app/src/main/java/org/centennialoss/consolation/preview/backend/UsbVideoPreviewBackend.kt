@@ -59,6 +59,20 @@ interface UsbVideoPreviewBackend : PreviewRenderer {
     fun setRotation(degrees: Int)
     fun setFlip(horizontal: Boolean, vertical: Boolean)
 
+    /**
+     * Full preview transform for backends that render into a SurfaceView, where
+     * the View system cannot rotate or mirror the content: rotation in degrees,
+     * mirror flags, zoom scale, and pan in NDC units (-1..1 across the surface).
+     */
+    fun setPreviewTransform(
+        rotationDegrees: Int,
+        flipHorizontal: Boolean,
+        flipVertical: Boolean,
+        scale: Float,
+        panXNdc: Float,
+        panYNdc: Float,
+    ) = Unit
+
     fun dispose()
 
     /**

@@ -521,6 +521,16 @@ typedef struct uvc_frame {
 	 * (ISO only).  len = actual_length incl. UVC header; flags: bit0 first
 	 * packet of a libusb transfer, bit1 EOF bit set, bit2 header_len != 12,
 	 * bit3 header-only (no image data).  count saturates at the array size. */
+	/** Planar-MJPEG frames decoded straight into GPU-sampleable memory: one
+	 * R8 AHardwareBuffer per plane (NULL past the plane count, e.g. gray).
+	 * data is NULL for such frames; the renderer binds them via EGLImage.
+	 * ids are unique per allocation so a renderer cache never confuses a
+	 * recycled pointer with the buffer it previously mapped. */
+	void *yuv_hardware_buffers[3];
+	uint64_t yuv_hardware_buffer_ids[3];
+	/** 1 = R8 buffers (one byte per texel); 4 = RGBA8 buffers a quarter as
+	 * wide with four consecutive plane bytes packed into one texel. */
+	uint32_t yuv_hardware_buffer_bytes_per_texel;
 #define UVC_ISO_TRACE_MAX 512
 	uint16_t iso_trace_len[UVC_ISO_TRACE_MAX];
 	uint8_t iso_trace_flags[UVC_ISO_TRACE_MAX];
@@ -856,7 +866,15 @@ uvc_error_t uvc_mjpeg2bgr(uvc_frame_t *in, uvc_frame_t *out);		// XXX
 uvc_error_t uvc_mjpeg2rgb565(uvc_frame_t *in, uvc_frame_t *out);	// XXX
 uvc_error_t uvc_mjpeg2rgbx(uvc_frame_t *in, uvc_frame_t *out);		// XXX
 uvc_error_t uvc_mjpeg2yuyv(uvc_frame_t *in, uvc_frame_t *out);		// XXX
-uvc_error_t uvc_mjpeg2yuv_planar(uvc_frame_t *in, uvc_frame_t *out);	// XXX
+uvc_error_t uvc_mjpeg2yuv_planar(uvc_frame_t *in, uvc_frame_t *out);
+/** Parse the MJPEG header and report the planar layout tj would produce:
+ * widths/heights per plane (0 for absent chroma planes on gray). */
+uvc_error_t uvc_mjpeg_planar_layout(uvc_frame_t *in, uint32_t widths[3],
+	uint32_t heights[3], int *subsamp);
+/** Decode into caller-supplied planes (row strides in bytes). planes[1..2]
+ * may be NULL for gray.  Applies the corrupt-frame warning policy. */
+uvc_error_t uvc_mjpeg2yuv_planes(uvc_frame_t *in, unsigned char *planes[3],
+	const int strides[3]);	// XXX
 #endif
 
 uvc_error_t uvc_yuyv2rgb565(uvc_frame_t *in, uvc_frame_t *out);		// XXX

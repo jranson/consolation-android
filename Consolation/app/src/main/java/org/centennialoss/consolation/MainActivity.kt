@@ -17,6 +17,7 @@ import android.text.SpannableString
 import android.text.style.ForegroundColorSpan
 import android.view.ContextThemeWrapper
 import android.view.Menu
+import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
@@ -132,7 +133,9 @@ private val ConsolationColorScheme = darkColorScheme(
 )
 
 class MainActivity : ComponentActivity() {
-    private lateinit var previewTexture: TextureView
+    /** SurfaceView for every format except H264 (MediaCodec renders straight into the
+     *  surface, so only a TextureView can still be flipped/zoomed by the View system). */
+    private lateinit var previewTexture: View
     private lateinit var rootView: View
     private lateinit var deviceRepository: UsbCaptureDeviceRepository
     private lateinit var previewBackend: UsbVideoPreviewBackend
@@ -565,7 +568,7 @@ class MainActivity : ComponentActivity() {
 
     private fun replacePreviewTextureAfterUsbRemoval() {
         if (::previewTexture.isInitialized) {
-            previewTexture.surfaceTextureListener = null
+            (previewTexture as? TextureView)?.surfaceTextureListener = null
             previewTexture.isVisible = false
         }
         previewTextureGeneration++
@@ -1581,18 +1584,42 @@ class MainActivity : ComponentActivity() {
                     }
                 },
         ) {
+            val useSurfaceView = selectedPixelFormatPreference != PixelFormatPreference.H264
+            /* With a SurfaceView the renderer rotates the content, so the box itself must
+             * take the rotated aspect; the TextureView path rotates the whole view instead. */
+            val boxAspect = if (useSurfaceView && currentRotation % 180 == 90) {
+                1f / previewAspectRatio
+            } else {
+                previewAspectRatio
+            }
+            if (useSurfaceView) {
+                LaunchedEffect(
+                    currentRotation, isFlippedHorizontal, isFlippedVertical, baseScale,
+                    currentZoom, zoomPanOffsetX, zoomPanOffsetY,
+                    previewLayoutWidthPx, previewLayoutHeightPx,
+                ) {
+                    val w = previewLayoutWidthPx
+                    val h = previewLayoutHeightPx
+                    val panX = if (currentZoom > 0 && w > 0f) 2f * zoomPanOffsetX / w else 0f
+                    val panY = if (currentZoom > 0 && h > 0f) -2f * zoomPanOffsetY / h else 0f
+                    previewBackend.setPreviewTransform(
+                        currentRotation, isFlippedHorizontal, isFlippedVertical, baseScale, panX, panY,
+                    )
+                }
+            }
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                key(previewTextureGeneration) {
+                key(previewTextureGeneration, useSurfaceView) {
                     AndroidView(
                         factory = { context ->
-                            TextureView(context).also {
+                            val view: View = if (useSurfaceView) SurfaceView(context) else TextureView(context)
+                            view.also {
                                 previewTexture = it
                                 it.isVisible = isPlaybackRunningUi
                             }
                         },
                         modifier = Modifier
                             .fillMaxHeight()
-                            .aspectRatio(previewAspectRatio)
+                            .aspectRatio(boxAspect)
                             .onSizeChanged {
                                 previewLayoutWidthPx = it.width.toFloat()
                                 previewLayoutHeightPx = it.height.toFloat()
@@ -1629,11 +1656,13 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                             .graphicsLayer {
-                                scaleX = baseScale * if (isFlippedHorizontal) -1f else 1f
-                                scaleY = baseScale * if (isFlippedVertical) -1f else 1f
-                                rotationZ = currentRotation.toFloat()
-                                translationX = if (currentZoom > 0) zoomPanOffsetX else 0f
-                                translationY = if (currentZoom > 0) zoomPanOffsetY else 0f
+                                if (!useSurfaceView) {
+                                    scaleX = baseScale * if (isFlippedHorizontal) -1f else 1f
+                                    scaleY = baseScale * if (isFlippedVertical) -1f else 1f
+                                    rotationZ = currentRotation.toFloat()
+                                    translationX = if (currentZoom > 0) zoomPanOffsetX else 0f
+                                    translationY = if (currentZoom > 0) zoomPanOffsetY else 0f
+                                }
                             },
                         update = {
                             it.isVisible = isPlaybackRunningUi
