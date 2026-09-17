@@ -19,8 +19,17 @@
  #include "libuvc/libuvc_internal.h"
  #include "libuvc/stream_internal.h"
  
+/*
+ * Packets per ISO transfer sets the reap granularity: libusb only hands a
+ * transfer back once every packet's service interval has elapsed, so a frame
+ * whose EOF lands early in a transfer waits for the rest.  At bInterval=1 on
+ * high speed one packet is 125 us: 32 packets held the EOF up to 4 ms (2 ms
+ * average); 8 packets caps that at 1 ms.  The transfer count below is raised
+ * to keep the same 128 ms of bus time queued in the kernel.  Cost is ~1000
+ * reap ioctls/s instead of ~250, all on the pre-allocated URB path.
+ */
 #ifndef LIBUVC_NUM_ISO_PACKETS_PER_XFER
-#define LIBUVC_NUM_ISO_PACKETS_PER_XFER 32
+#define LIBUVC_NUM_ISO_PACKETS_PER_XFER 8
 #endif
 /*
  * This is the number of libusb transfers submitted for ISO streaming, not the
@@ -30,7 +39,7 @@
  * time; otherwise ISO setup will write past the end of the stream handle.
  */
 #ifndef LIBUVC_NUM_ISO_TRANSFER_BUFS
-#define LIBUVC_NUM_ISO_TRANSFER_BUFS 32
+#define LIBUVC_NUM_ISO_TRANSFER_BUFS 128
 #endif
 #if LIBUVC_NUM_ISO_TRANSFER_BUFS > LIBUVC_MAX_TRANSFER_BUFS
 #error "LIBUVC_NUM_ISO_TRANSFER_BUFS cannot exceed LIBUVC_MAX_TRANSFER_BUFS array capacity"

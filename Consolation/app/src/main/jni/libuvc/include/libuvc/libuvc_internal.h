@@ -295,8 +295,10 @@ typedef struct uvc_device_info {
 #ifndef LIBUVC_NUM_TRANSFER_BUFS
 #define LIBUVC_NUM_TRANSFER_BUFS 24
 #endif
+/* Sized for the ISO ring (stream_iso.c: 128 transfers x 8 packets).  The
+ * per-slot arrays are pointers and bytes, so 128 costs ~2.5 KB per stream. */
 #ifndef LIBUVC_MAX_TRANSFER_BUFS
-#define LIBUVC_MAX_TRANSFER_BUFS 32
+#define LIBUVC_MAX_TRANSFER_BUFS 128
 #endif
 #if LIBUVC_NUM_TRANSFER_BUFS > LIBUVC_MAX_TRANSFER_BUFS
 #error "LIBUVC_NUM_TRANSFER_BUFS cannot exceed LIBUVC_MAX_TRANSFER_BUFS array capacity"
