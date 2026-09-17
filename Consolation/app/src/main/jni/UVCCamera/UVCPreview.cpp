@@ -45,6 +45,9 @@
 #include "libuvc_internal.h"
 
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/system_properties.h>
+#include <stdio.h>
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -96,6 +99,99 @@ static inline void atomic_store_max(std::atomic<uint64_t> &target, uint64_t valu
 	}
 }
 
+} // namespace
+
+/* Frame-buffer integrity probe: each hop re-samples the bytes it is about to
+ * read and compares with the fingerprint taken when they were produced.  A
+ * mismatch means something wrote into the buffer while it was in flight, and
+ * the stage name says between which two threads.  Reads ~1 KiB per check. */
+#ifndef UVC_FRAME_INTEGRITY_CHECK
+#define UVC_FRAME_INTEGRITY_CHECK 1
+#endif
+
+namespace {
+static bool frame_integrity_ok(const uvc_frame_t *frame, const char *stage,
+	std::atomic<uint32_t> &mismatches)
+{
+#if UVC_FRAME_INTEGRITY_CHECK
+	if (!frame || !frame->data || !frame->integrity_sample_hash)
+		return true;
+	const size_t len = frame->actual_bytes ? frame->actual_bytes : frame->data_bytes;
+	const uint32_t now = uvc_frame_sample_hash(frame->data, len);
+	if (LIKELY(now == frame->integrity_sample_hash))
+		return true;
+	const uint32_t n = mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n <= 10 || !(n % 100))
+		LOGW("frame-integrity: buffer changed in flight stage=%s count=%u seq=%u bytes=%zu "
+			"expected=%08x now=%08x fmt=%d slot=%u",
+			stage, n, frame->sequence, len, frame->integrity_sample_hash, now,
+			frame->frame_format, frame->library_frame_slot);
+	return false;
+#else
+	(void)frame; (void)stage; (void)mismatches;
+	return true;
+#endif
+}
+/* Debug-only raw MJPEG dump, driven by a system property so it costs nothing
+ * unless armed:  adb shell setprop debug.consolation.mjpeg_dump <N>
+ * dumps the next N consecutive frames handed to the async decoder into
+ * /data/data/<pkg>/cache/mjpeg_dump/<seq>.jpg (pull with `adb shell run-as`).
+ * Setting a different value re-arms it. The property is polled once per
+ * 60 frames so the hot path pays one property read per second at most. */
+static void debug_mjpeg_dump_maybe(const uvc_frame_t *frame)
+{
+	static char s_armed_value[PROP_VALUE_MAX] = {};
+	static int s_remaining = 0;
+	static uint32_t s_poll = 0;
+	static const char *s_dir = "/data/data/org.centennialoss.consolation/cache/mjpeg_dump";
+
+	if (!frame || !frame->data || !frame->actual_bytes)
+		return;
+	if (s_remaining <= 0) {
+		if ((s_poll++ % 60) != 0)
+			return;
+		char value[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.consolation.mjpeg_dump", value) <= 0
+				|| !value[0] || !strcmp(value, s_armed_value))
+			return;
+		strncpy(s_armed_value, value, sizeof(s_armed_value) - 1);
+		s_remaining = atoi(value);
+		if (s_remaining <= 0)
+			return;
+		mkdir(s_dir, 0755);
+		LOGW("mjpeg-dump: armed for %d frames -> %s", s_remaining, s_dir);
+	}
+	char path[256];
+	snprintf(path, sizeof(path), "%s/%06u.jpg", s_dir, frame->sequence);
+	FILE *f = fopen(path, "wb");
+	if (!f) {
+		LOGW("mjpeg-dump: cannot open %s", path);
+		s_remaining = 0;
+		return;
+	}
+	fwrite(frame->data, 1, frame->actual_bytes, f);
+	fclose(f);
+	/* Sidecar: one line per USB packet "len flags cumulative_image_bytes". */
+	snprintf(path, sizeof(path), "%s/%06u.pkts", s_dir, frame->sequence);
+	f = fopen(path, "w");
+	if (f) {
+		size_t cum = 0;
+		for (unsigned i = 0; i < frame->iso_trace_count; i++) {
+			const unsigned len = frame->iso_trace_len[i];
+			const unsigned fl = frame->iso_trace_flags[i];
+			if (!(fl & 8u) && len > 12)
+				cum += len - 12;
+			fprintf(f, "%u %u %zu\n", len, fl, cum);
+		}
+		fclose(f);
+	}
+	if (--s_remaining == 0)
+		LOGW("mjpeg-dump: done");
+}
+
+static std::atomic<uint32_t> g_integrity_mismatch_cb{0};
+static std::atomic<uint32_t> g_integrity_mismatch_decode{0};
+static std::atomic<uint32_t> g_integrity_mismatch_render{0};
 } // namespace
 
 /** processingUvcSeqState bit63 marks the last-sequence value as valid. */
@@ -1134,9 +1230,20 @@ void UVCPreview::addMjpegDecodeFrame(uvc_frame_t *frame) {
 	uvc_frame_t *queued = uvc_allocate_frame(0);
 	if (UNLIKELY(!queued))
 		return;
+	/* Stage 1: USB-thread publish -> libuvc callback thread. */
+	if (UNLIKELY(!frame_integrity_ok(frame, "publish->callback", g_integrity_mismatch_cb))) {
+		processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
 	*queued = *frame;
 	queued->library_owns_data = 0;
-	uvc_frame_retain(queued);
+	if (UNLIKELY(!uvc_frame_retain(queued))) {
+		/* No slot reference: the bytes could be overwritten by the USB thread
+		 * while the decoder reads them. Never hand such a frame to the async
+		 * decoder (sequential overwrite shows as a shredded lower half). */
+		uvc_free_frame(queued);
+		return;
+	}
 	pthread_mutex_lock(&mjpeg_decode_mutex);
 	if (isRunning() && mjpeg_decode_thread_joinable) {
 		uvc_frame_t *drop = mjpeg_decode_frame_ring.enqueue_drop_oldest_if_full(queued);
@@ -1195,15 +1302,40 @@ void UVCPreview::do_mjpeg_decode() {
 		if (!frame)
 			break;
 
+		/* Stage 2: callback thread enqueue -> decode thread dequeue (retained slot). */
+		if (UNLIKELY(!frame_integrity_ok(frame, "callback->decode", g_integrity_mismatch_decode))) {
+			processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+			uvc_frame_release(frame);
+			uvc_free_frame(frame);
+			continue;
+		}
+		debug_mjpeg_dump_maybe(frame);
 		uvc_frame_t *decoded = get_frame(0);
 		if (LIKELY(decoded)) {
 			const uint64_t t_convert = processing_now_ns();
 			const uvc_error_t result = uvc_mjpeg2yuv_planar(frame, decoded);
 			recordPreviewConversionTiming(processing_now_ns() - t_convert);
 			if (LIKELY(result == UVC_SUCCESS)) {
+				/* Stage 3 check happens on the preview thread: was the JPEG
+				 * still intact once decoding finished (writer overtook reader)? */
+				if (UNLIKELY(!frame_integrity_ok(frame, "during-decode", g_integrity_mismatch_decode))) {
+					processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+					recycle_frame(decoded);
+					decoded = NULL;
+					uvc_frame_release(frame);
+					uvc_free_frame(frame);
+					continue;
+				}
+#if UVC_FRAME_INTEGRITY_CHECK
+				decoded->integrity_sample_hash =
+					uvc_frame_sample_hash(decoded->data, decoded->actual_bytes);
+#endif
 				addPreviewFrame(decoded);
 				decoded = NULL;
 			} else {
+				/* Corrupt or undecodable frame: not shown, last good frame stays.
+				 * Surface it in the dropped-frames telemetry counter. */
+				processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
 				UVC_DIAG_LOGI("mjpeg-diag:async-planar-decode-fail seq=%u bytes=%zu result=%d frame=%ux%u",
 					frame->sequence,
 					frame->actual_bytes,
@@ -1558,6 +1690,13 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 					if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG_YUV_PLANAR) {
 						uint64_t frame_ready_ns = 0;
 						uint64_t surface_wait_ns = 0;
+						/* Stage 4: decode thread -> preview thread (pool frame). */
+						if (UNLIKELY(!frame_integrity_ok(frame, "decode->render", g_integrity_mismatch_render))) {
+							processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+							recycle_frame(frame);
+							frame = NULL;
+							continue;
+						}
 						if (renderFrameDirectToSurface(frame, &mPreviewWindow,
 								&preview_mutex, &frame_ready_ns, &surface_wait_ns)
 								&& frame_ready_ns && frame->arrival_monotonic_ns) {

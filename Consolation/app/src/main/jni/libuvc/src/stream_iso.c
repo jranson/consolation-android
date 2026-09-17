@@ -4,9 +4,13 @@
 
  #ifdef __ANDROID__
  #include <android/log.h>
+ #include <sys/system_properties.h>
  #endif
  
  #include <stdlib.h>
+ #include <stdio.h>
+ #include <errno.h>
+ #include <unistd.h>
  #include <string.h>
  
  #include "libuvc/stream_log.h"
@@ -165,8 +169,95 @@ static void _uvc_diag_iso_packet_shape(uvc_stream_handle_t *strmh,
 }
 #endif /* UVC_RUNTIME_DIAG_ENABLED */
  
+/*
+ * High-bandwidth ISO IN (wMaxPacketSize mult > 1, i.e. 2 or 3 transactions per
+ * microframe) is corrupted by the Mentor MUSB host controller used on Unisoc
+ * (and some other low-cost) SoCs: a few bytes are inserted or dropped inside the
+ * packet at transaction boundaries, so an MJPEG frame still carries SOI/EOI but
+ * decodes shredded below the damage.  Measured on a Unisoc ums9230 tablet:
+ * 10/300 frames damaged at 3072 B/uframe, 13/302 at 2048, 0/301 at 1024.
+ * Single-transaction endpoints (<= 1024 B/uframe) are reliable there, so on such
+ * hosts we restrict alt-setting selection to them.
+ *
+ * Detection: the sysfs bus symlink names the controller driver (readable by an
+ * app process), e.g. .../64900000.usb/musb-hdrc.1.auto/usb1.  Fallback when the
+ * link cannot be read: Unisoc platform names (ro.board.platform ums.., sc98.., ud7..).
+ * Override for testing:  adb shell setprop debug.consolation.iso_max_packet <N>
+ * (N > 0 forces that cap; the property wins over auto-detection).
+ */
+#define LIBUVC_MUSB_ISO_PACKET_CAP 1024u
+
+/* This file's LOGI compiles out under LOG_NDEBUG; the cap decision must be
+ * visible in normal builds, so log it directly. */
+#ifdef __ANDROID__
+/* Tag must match the one apps allowlist via log.tag.* (libuvc/stream is
+ * filtered out on devices whose default log level is E). */
+#define UVC_HOSTCAP_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "libUVCCamera", __VA_ARGS__)
+#else
+#define UVC_HOSTCAP_LOGI(...) LOGI(__VA_ARGS__)
+#endif
+
+static unsigned int _uvc_iso_host_packet_cap(uvc_stream_handle_t *strmh) {
+#ifdef __ANDROID__
+	 char value[PROP_VALUE_MAX] = {0};
+	 char path[64];
+	 char target[256];
+	 ssize_t n;
+	 uint8_t bus;
+	 const char *why = NULL;
+
+	 if (__system_property_get("debug.consolation.iso_max_packet", value) > 0
+			 && value[0]) {
+		 const unsigned int forced = (unsigned int)atoi(value);
+		 UVC_HOSTCAP_LOGI("libuvc iso host cap: forced by property %s -> %u", value, forced);
+		 return forced;
+	 }
+
+	 bus = libusb_get_bus_number(libusb_get_device(strmh->devh->usb_devh));
+	 if (bus) {
+		 snprintf(path, sizeof(path), "/sys/bus/usb/devices/usb%u", (unsigned)bus);
+		 n = readlink(path, target, sizeof(target) - 1);
+		 if (n > 0) {
+			 target[n] = 0;
+			 if (strstr(target, "musb"))
+				 why = "musb host controller";
+			 UVC_HOSTCAP_LOGI("libuvc iso host cap: bus %u -> %s", (unsigned)bus, target);
+		 } else {
+			 UVC_HOSTCAP_LOGI("libuvc iso host cap: readlink(%s) failed errno=%d", path, errno);
+		 }
+	 }
+	 if (!why && bus == 0) {
+		 /* Bus unknown (wrapped fd without a resolvable path): probe usb1..usb4. */
+		 unsigned int b;
+		 for (b = 1; b <= 4 && !why; b++) {
+			 snprintf(path, sizeof(path), "/sys/bus/usb/devices/usb%u", b);
+			 n = readlink(path, target, sizeof(target) - 1);
+			 if (n > 0) {
+				 target[n] = 0;
+				 if (strstr(target, "musb"))
+					 why = "musb host controller (bus probe)";
+			 }
+		 }
+	 }
+	 if (!why && __system_property_get("ro.board.platform", value) > 0) {
+		 if (!strncmp(value, "ums", 3) || !strncmp(value, "sc98", 4)
+				 || !strncmp(value, "sp98", 4) || !strncmp(value, "ud7", 3))
+			 why = "unisoc platform";
+	 }
+	 if (why) {
+		 UVC_HOSTCAP_LOGI("libuvc iso host cap: %s -> limiting ISO packets to %u B/uframe "
+			 "(single transaction)", why, LIBUVC_MUSB_ISO_PACKET_CAP);
+		 return LIBUVC_MUSB_ISO_PACKET_CAP;
+	 }
+	 return 0;
+#else
+	 (void)strmh;
+	 return 0;
+#endif
+}
+
  static void _uvc_process_payload_iso_packet(uvc_stream_handle_t *strmh,
-		 const uint8_t *payload, size_t payload_len) {
+		 const uint8_t *payload, size_t payload_len, int first_in_transfer) {
 	 size_t header_len;
 	 uint8_t header_info = 0;
 	 size_t data_len;
@@ -187,6 +278,18 @@ static void _uvc_diag_iso_packet_shape(uvc_stream_handle_t *strmh,
 	 }
  
 	 data_len = payload_len - header_len;
+	 if (header_len >= 2)
+		 header_info = payload[1];
+
+	 /* Diagnostic packet trace for the frame under assembly (see uvc_frame_t). */
+	 if (strmh->iso_trace_count < UVC_ISO_TRACE_MAX) {
+		 const uint16_t i = strmh->iso_trace_count++;
+		 strmh->iso_trace_len[i] = (uint16_t)(payload_len > 0xffff ? 0xffff : payload_len);
+		 strmh->iso_trace_flags[i] = (uint8_t)((first_in_transfer ? 1u : 0u)
+			 | ((header_info & UVC_STREAM_EOF) ? 2u : 0u)
+			 | (header_len != 12 ? 4u : 0u)
+			 | (data_len == 0 ? 8u : 0u));
+	 }
  
 	 if (UNLIKELY(header_len < 2)) {
 		 header_info = 0;
@@ -208,17 +311,32 @@ static void _uvc_diag_iso_packet_shape(uvc_stream_handle_t *strmh,
 				 data_len);
 		 }
  
-		 if (UNLIKELY(header_info & UVC_STREAM_ERR)) {
-			 LOGI("startup-diag:libuvc iso ERR bit set in header "
-				 "(before_first_payload=%d)",
-				 !strmh->first_video_payload_received);
-		 }
- 
 		 if ((strmh->fid != (header_info & UVC_STREAM_FID)) && strmh->got_bytes) {
 			 _uvc_swap_buffers(strmh, "iso-fid");
 		 }
- 
+
 		 strmh->fid = header_info & UVC_STREAM_FID;
+
+		 if (UNLIKELY(header_info & UVC_STREAM_ERR)) {
+			 /* UVC 1.5 2.4.3.3: the device hit an error transmitting this
+			  * frame (typically its FIFO overran because the host link is too
+			  * slow, e.g. a USB 2.0 port at 3072 B/uframe).  The frame has a
+			  * hole; an MJPEG with a hole still carries SOI/EOI and decodes
+			  * as a shredded lower half.  Mark it so it is dropped at publish.
+			  * Only poison the frame in progress, not the next one, when the
+			  * ERR arrives on an idle header between frames. */
+			 if (strmh->got_bytes || data_len)
+				 strmh->bfh_err |= UVC_STREAM_ERR;
+			 strmh->diag_bfh_err_packets++;
+			 if (strmh->diag_bfh_err_packets == 1
+					 || !(strmh->diag_bfh_err_packets % 1000)) {
+				 LOGI("libuvc iso ERR bit set in payload header count=%u "
+					 "(before_first_payload=%d got_bytes=%zu data_len=%zu)",
+					 strmh->diag_bfh_err_packets,
+					 !strmh->first_video_payload_received,
+					 strmh->got_bytes, data_len);
+			 }
+		 }
  
 		 if (header_info & UVC_STREAM_PTS) {
 			 if (LIKELY(variable_offset + 4 <= header_len)) {
@@ -291,7 +409,8 @@ static void _uvc_diag_iso_packet_shape(uvc_stream_handle_t *strmh,
 		 _uvc_diag_iso_packet_shape(strmh, packet->actual_length, packet->length);
 #endif
 		 payload = libusb_get_iso_packet_buffer_simple(transfer, packet_id);
-		 _uvc_process_payload_iso_packet(strmh, payload, packet->actual_length);
+		 _uvc_process_payload_iso_packet(strmh, payload, packet->actual_length,
+			 packet_id == 0);
 	 }
  }
  
@@ -303,6 +422,7 @@ static void _uvc_diag_iso_packet_shape(uvc_stream_handle_t *strmh,
 	 const struct libusb_interface_descriptor *selected_altsetting = NULL;
 	 const struct libusb_endpoint_descriptor *selected_endpoint = NULL;
 	 unsigned int selected_packet_size = 0;
+	 unsigned int packet_cap;
 	 uint32_t required_payload_size;
 	 int selected_satisfies_required = 0;
 	 int altsetting_id;
@@ -315,6 +435,7 @@ static void _uvc_diag_iso_packet_shape(uvc_stream_handle_t *strmh,
 		 return UVC_ERROR_INVALID_PARAM;
  
 	 required_payload_size = _uvc_iso_required_payload_size(strmh, bandwidth_factor);
+	 packet_cap = _uvc_iso_host_packet_cap(strmh);
  
 	 for (altsetting_id = 0; altsetting_id < interface->num_altsetting; ++altsetting_id) {
 		 const struct libusb_interface_descriptor *altsetting =
@@ -330,14 +451,17 @@ static void _uvc_diag_iso_packet_shape(uvc_stream_handle_t *strmh,
 		 if (!packet_size)
 			 continue;
 
-		 UVC_DIAG_LOGI("mjpeg-diag:iso-alt alt=%u ep=0x%02x packet_size=%u "
-			 "wMaxPacketSize=0x%04x interval=%u required=%u",
+		 UVC_HOSTCAP_LOGI("libuvc iso-alt alt=%u ep=0x%02x packet_size=%u "
+			 "wMaxPacketSize=0x%04x interval=%u required=%u cap=%u",
 			 (unsigned)altsetting->bAlternateSetting,
 			 (unsigned)endpoint->bEndpointAddress,
 			 packet_size,
 			 (unsigned)endpoint->wMaxPacketSize,
 			 (unsigned)endpoint->bInterval,
-			 (unsigned)required_payload_size);
+			 (unsigned)required_payload_size,
+			 packet_cap);
+		 if (packet_cap && packet_size > packet_cap)
+			 continue;
  
 #if LIBUVC_ISO_PREFER_MAX_PACKET_SIZE
 		 if (!selected_altsetting || packet_size > selected_packet_size) {
@@ -380,7 +504,7 @@ static void _uvc_diag_iso_packet_shape(uvc_stream_handle_t *strmh,
  
 	 strmh->diag_selected_altsetting = selected_altsetting->bAlternateSetting;
 	 strmh->num_transfer_bufs = LIBUVC_NUM_ISO_TRANSFER_BUFS;
-	 UVC_DIAG_LOGI("mjpeg-diag:iso-selected alt=%u ep=0x%02x packet_size=%u "
+	 UVC_HOSTCAP_LOGI("libuvc iso-selected alt=%u ep=0x%02x packet_size=%u "
 		 "required=%u prefer_max=%u",
 		 (unsigned)selected_altsetting->bAlternateSetting,
 		 (unsigned)selected_endpoint->bEndpointAddress,

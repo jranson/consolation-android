@@ -63,16 +63,6 @@ void _uvc_process_payload_bulk(uvc_stream_handle_t *strmh, const uint8_t *payloa
 				data_len);
 		}
 
-		if (UNLIKELY(header_info & UVC_STREAM_ERR)) {
-			LOGI("startup-diag:libuvc bulk ERR bit set in header "
-				"(before_first_payload=%d)",
-				!strmh->first_video_payload_received);
-			/* A BFH ERR bit in a completed bulk payload is a device stream
-			 * condition, not a USB endpoint halt. Do not issue synchronous
-			 * control transfers from this hot path; true endpoint halts are
-			 * reported separately as LIBUSB_TRANSFER_STALL. */
-		}
-
 		if ((strmh->fid != (header_info & UVC_STREAM_FID)) && strmh->got_bytes) {
 			/* The frame ID bit was flipped, but we have image data sitting
 				around from prior transfers. This means the camera didn't send
@@ -81,6 +71,26 @@ void _uvc_process_payload_bulk(uvc_stream_handle_t *strmh, const uint8_t *payloa
 		}
 
 		strmh->fid = header_info & UVC_STREAM_FID;
+
+		if (UNLIKELY(header_info & UVC_STREAM_ERR)) {
+			/* A BFH ERR bit in a completed bulk payload is a device stream
+			 * condition, not a USB endpoint halt. Do not issue synchronous
+			 * control transfers from this hot path; true endpoint halts are
+			 * reported separately as LIBUSB_TRANSFER_STALL.
+			 * Per UVC 1.5 2.4.3.3 the frame is damaged: mark it so it is
+			 * dropped at publish instead of decoded with a hole. */
+			if (strmh->got_bytes || data_len)
+				strmh->bfh_err |= UVC_STREAM_ERR;
+			strmh->diag_bfh_err_packets++;
+			if (strmh->diag_bfh_err_packets == 1
+					|| !(strmh->diag_bfh_err_packets % 1000)) {
+				LOGI("libuvc bulk ERR bit set in payload header count=%u "
+					"(before_first_payload=%d got_bytes=%zu data_len=%zu)",
+					strmh->diag_bfh_err_packets,
+					!strmh->first_video_payload_received,
+					strmh->got_bytes, data_len);
+			}
+		}
 
 		if (header_info & UVC_STREAM_PTS) {
 			// XXX saki some camera may send broken packet or failed to receive all data

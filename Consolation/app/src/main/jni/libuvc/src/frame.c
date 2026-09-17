@@ -103,6 +103,30 @@ void uvc_set_rgbx_converter_backend(uvc_rgbx_converter_backend_t backend) {
 }
 
 /** @internal */
+uint32_t uvc_frame_sample_hash(const void *data, size_t len) {
+	const uint8_t *bytes = (const uint8_t *)data;
+	uint32_t hash = 2166136261u;
+	size_t chunk;
+
+	if (!bytes || !len)
+		return 0;
+	for (chunk = 0; chunk < 16; chunk++) {
+		size_t offset = (len * chunk) / 16;
+		size_t end = offset + 64;
+		size_t i;
+		if (end > len)
+			end = len;
+		for (i = offset; i < end; i++) {
+			hash ^= bytes[i];
+			hash *= 16777619u;
+		}
+	}
+	/* Fold in the length so a same-prefix, different-size frame differs. */
+	hash ^= (uint32_t)len;
+	hash *= 16777619u;
+	return hash ? hash : 1u;
+}
+
 uvc_error_t uvc_ensure_frame_size(uvc_frame_t *frame, size_t need_bytes) {
 	if (UNLIKELY(!need_bytes))
 		return UVC_ERROR_NO_MEM;

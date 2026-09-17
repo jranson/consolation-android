@@ -102,14 +102,15 @@ void _uvc_stream_try_acquire_outbuf(uvc_stream_handle_t *strmh) {
 	pthread_mutex_unlock(&strmh->cb_mutex);
 }
 
-void uvc_frame_retain(uvc_frame_t *frame) {
+int uvc_frame_retain(uvc_frame_t *frame) {
 	uvc_stream_handle_t *strmh;
 	if (!frame || !frame->library_frame_owner || !_uvc_frame_slot_valid(frame->library_frame_slot))
-		return;
+		return 0;
 	strmh = (uvc_stream_handle_t *)frame->library_frame_owner;
 	pthread_mutex_lock(&strmh->cb_mutex);
 	_uvc_frame_retain_locked(strmh, frame->library_frame_slot);
 	pthread_mutex_unlock(&strmh->cb_mutex);
+	return 1;
 }
 
 void uvc_frame_release(uvc_frame_t *frame) {
@@ -193,6 +194,7 @@ static void _uvc_discard_assembled_frame(uvc_stream_handle_t *strmh, const char 
 	strmh->bfh_err = 0;
 	_uvc_diag_iso_frame_reset(strmh);
 	_uvc_mjpeg_scan_reset(strmh);
+	strmh->iso_trace_count = 0;
 }
 
 struct format_table_entry {
@@ -739,6 +741,13 @@ void _uvc_swap_buffers(uvc_stream_handle_t *strmh, const char *reason) {
 			? strmh->frame_complete_monotonic_ns : uvc_diag_now_ns();
 		strmh->hold_slot = strmh->out_slot;
 		strmh->holdbuf = strmh->frame_pool[strmh->hold_slot];
+		/* Publish-time fingerprint; consumers compare before reading. */
+		strmh->hold_sample_hash = uvc_frame_sample_hash(strmh->holdbuf, strmh->got_bytes);
+		strmh->hold_iso_trace_count = strmh->iso_trace_count;
+		memcpy(strmh->hold_iso_trace_len, strmh->iso_trace_len,
+			(size_t)strmh->iso_trace_count * sizeof(strmh->iso_trace_len[0]));
+		memcpy(strmh->hold_iso_trace_flags, strmh->iso_trace_flags,
+			(size_t)strmh->iso_trace_count * sizeof(strmh->iso_trace_flags[0]));
 		strmh->hold_last_scr = strmh->last_scr;
 		strmh->hold_pts = strmh->pts;
 		strmh->hold_seq = strmh->seq;
@@ -765,6 +774,7 @@ void _uvc_swap_buffers(uvc_stream_handle_t *strmh, const char *reason) {
 	strmh->bfh_err = 0;	// XXX
 	_uvc_diag_iso_frame_reset(strmh);
 	_uvc_mjpeg_scan_reset(strmh);
+	strmh->iso_trace_count = 0;
 }
 
 /* Unified transfer-slot cleanup:
@@ -885,20 +895,31 @@ static void _uvc_discard_iso_transfer_gap(uvc_stream_handle_t *strmh,
 static void _uvc_drain_ordered_iso_transfers(uvc_stream_handle_t *strmh) {
 	uint32_t guard = 0;
 
-	while (strmh->num_transfer_bufs
-			&& guard++ < strmh->num_transfer_bufs
-			&& strmh->iso_transfer_pending[strmh->next_iso_transfer_id]) {
+	while (strmh->num_transfer_bufs && guard++ < strmh->num_transfer_bufs) {
 		const uint32_t transfer_id = strmh->next_iso_transfer_id;
-		const uint8_t pending = strmh->iso_transfer_pending[transfer_id];
 		struct libusb_transfer *ready = strmh->transfers[transfer_id];
-		int resubmit = pending != UVC_ISO_PENDING_STOP;
+		uint8_t pending;
+		int resubmit;
+
+		if (UNLIKELY(!ready)) {
+			/* Slot was deleted (submit failure / stop).  A deleted slot never
+			 * becomes pending again, so waiting on it would stall the ordered
+			 * drain forever and freeze the stream once every other transfer
+			 * had completed once.  Skip it and keep draining behind it. */
+			strmh->iso_transfer_pending[transfer_id] = 0;
+			strmh->next_iso_transfer_id =
+				(transfer_id + 1) % strmh->num_transfer_bufs;
+			continue;
+		}
+
+		pending = strmh->iso_transfer_pending[transfer_id];
+		if (!pending)
+			break;
+		resubmit = pending != UVC_ISO_PENDING_STOP;
 
 		strmh->iso_transfer_pending[transfer_id] = 0;
 		strmh->next_iso_transfer_id =
 			(transfer_id + 1) % strmh->num_transfer_bufs;
-
-		if (UNLIKELY(!ready))
-			continue;
 
 		if (pending == UVC_ISO_PENDING_COMPLETE) {
 			_uvc_diag_first_xfer_completed(strmh, ready);
@@ -1471,8 +1492,10 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 	strmh->next_iso_transfer_id = 0;
 	memset(strmh->stalled_transfer_slots, 0, sizeof(strmh->stalled_transfer_slots));
 	memset(strmh->iso_transfer_pending, 0, sizeof(strmh->iso_transfer_pending));
+	strmh->diag_bfh_err_packets = 0;
 	_uvc_diag_iso_frame_reset(strmh);
 	_uvc_mjpeg_scan_reset(strmh);
+	strmh->iso_trace_count = 0;
 
 	frame_desc = uvc_find_frame_desc_stream(strmh, ctrl->bFormatIndex, ctrl->bFrameIndex);
 	if (UNLIKELY(!frame_desc)) {
@@ -1607,6 +1630,7 @@ static void *_uvc_user_caller(void *arg) {
 	uvc_stream_handle_t *strmh = (uvc_stream_handle_t *) arg;
 
 	uint32_t last_seq = 0;
+	int deliver;
 
 	for (; 1 ;) {
 		pthread_mutex_lock(&strmh->cb_mutex);
@@ -1621,14 +1645,21 @@ static void *_uvc_user_caller(void *arg) {
 			}
 
 			last_seq = strmh->hold_seq;
-			if (LIKELY(!strmh->hold_bfh_err))	// XXX
+			/* Snapshot the error flag once, under the lock, and use that same
+			 * decision for populate, callback, and release.  hold_bfh_err is
+			 * rewritten by the USB thread on every publish; re-reading it after
+			 * unlock let a set->clear flip deliver the *previous* (already
+			 * released) frame to the user while the USB thread refilled its
+			 * slot, and a clear->set flip leak a slot reference.  ISO on USB 2.0
+			 * sets the error bit often enough to hit both regularly. */
+			deliver = !strmh->hold_bfh_err;
+			if (LIKELY(deliver))
 				_uvc_populate_frame(strmh);
 		}
 		pthread_mutex_unlock(&strmh->cb_mutex);
 
-		if (LIKELY(!strmh->hold_bfh_err))	// XXX
+		if (LIKELY(deliver)) {
 			strmh->user_cb(&strmh->frame, strmh->user_ptr);	// call user callback function
-		if (LIKELY(!strmh->hold_bfh_err)) {
 			uvc_frame_release(&strmh->frame);
 			strmh->frame.library_frame_owner = NULL;
 			strmh->frame.library_hardware_buffer = NULL;
@@ -1704,6 +1735,12 @@ void _uvc_populate_frame(uvc_stream_handle_t *strmh) {
 	frame->capture_time.tv_sec = 0;
 	frame->capture_time.tv_usec = 0;
 	frame->arrival_monotonic_ns = strmh->hold_start_monotonic_ns;
+	frame->integrity_sample_hash = strmh->hold_sample_hash;
+	frame->iso_trace_count = strmh->hold_iso_trace_count;
+	memcpy(frame->iso_trace_len, strmh->hold_iso_trace_len,
+		(size_t)strmh->hold_iso_trace_count * sizeof(frame->iso_trace_len[0]));
+	memcpy(frame->iso_trace_flags, strmh->hold_iso_trace_flags,
+		(size_t)strmh->hold_iso_trace_count * sizeof(frame->iso_trace_flags[0]));
 
 	/** @todo set the frame time */
 }

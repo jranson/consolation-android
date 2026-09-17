@@ -328,6 +328,10 @@ struct uvc_stream_handle {
   uint32_t pts, hold_pts;
   uint32_t last_scr, hold_last_scr;
   uint64_t frame_start_monotonic_ns, frame_complete_monotonic_ns, hold_start_monotonic_ns;
+  uint32_t hold_sample_hash;
+  uint16_t iso_trace_len[UVC_ISO_TRACE_MAX], hold_iso_trace_len[UVC_ISO_TRACE_MAX];
+  uint8_t iso_trace_flags[UVC_ISO_TRACE_MAX], hold_iso_trace_flags[UVC_ISO_TRACE_MAX];
+  uint16_t iso_trace_count, hold_iso_trace_count;
   size_t got_bytes, hold_bytes;
   /* Incremental MJPEG marker scan of outbuf (see _uvc_mjpeg_note_payload_append):
    * mjpeg_scan_pos = next pair index to examine; flags accumulate per frame.
@@ -378,6 +382,8 @@ struct uvc_stream_handle {
   uint16_t diag_bulk_timeout_count_before_payload;
   uint32_t diag_mjpeg_publish_count;
   uint32_t diag_mjpeg_drop_count;
+  /* Payload headers seen with the BFH ERR bit set (rate-limits the log line). */
+  uint32_t diag_bfh_err_packets;
   uint32_t diag_selected_frame_interval_100ns;
   int32_t diag_selected_altsetting;
   uint8_t diag_selected_isochronous;

@@ -513,6 +513,18 @@ typedef struct uvc_frame {
 	size_t library_hardware_buffer_stride;
 	/** @internal Planar YUV metadata for UVC_FRAME_FORMAT_MJPEG_YUV_PLANAR. */
 	int yuv_subsampling;
+	/** Sparse content hash taken when the frame was published/produced.
+	 * Consumers re-sample before use to detect the buffer changing underneath
+	 * them (see uvc_frame_sample_hash). 0 = not recorded. */
+	uint32_t integrity_sample_hash;
+	/** Diagnostic: USB packet trace for the payloads that built this frame
+	 * (ISO only).  len = actual_length incl. UVC header; flags: bit0 first
+	 * packet of a libusb transfer, bit1 EOF bit set, bit2 header_len != 12,
+	 * bit3 header-only (no image data).  count saturates at the array size. */
+#define UVC_ISO_TRACE_MAX 512
+	uint16_t iso_trace_len[UVC_ISO_TRACE_MAX];
+	uint8_t iso_trace_flags[UVC_ISO_TRACE_MAX];
+	uint16_t iso_trace_count;
 	size_t yuv_plane_offsets[3];
 	size_t yuv_plane_strides[3];
 	uint32_t yuv_plane_widths[3];
@@ -873,8 +885,13 @@ uvc_error_t uvc_any2yuyv(uvc_frame_t *in, uvc_frame_t *out);		// XXX
 
 uvc_error_t uvc_ensure_frame_size(uvc_frame_t *frame, size_t need_bytes); // XXX
 /** Retain/release borrowed stream frame buffers returned by callback/get_frame.
- * For copied/allocated frames these are no-ops. */
-void uvc_frame_retain(uvc_frame_t *frame);
+ * For copied/allocated frames these are no-ops.
+ * uvc_frame_retain returns 1 when a library slot reference was taken, 0 when
+ * the frame borrows no library slot (so the buffer is NOT protected from reuse). */
+int uvc_frame_retain(uvc_frame_t *frame);
+/** Sparse FNV-1a over 16 x 64-byte windows spread across [data, data+len).
+ * ~1 KiB of reads regardless of frame size; cheap enough for every frame. */
+uint32_t uvc_frame_sample_hash(const void *data, size_t len);
 void uvc_frame_release(uvc_frame_t *frame);
 /** Synchronize an optional AHardwareBuffer-backed borrowed frame for GPU use.
  * These are no-ops for malloc-backed frames and non-Android builds.

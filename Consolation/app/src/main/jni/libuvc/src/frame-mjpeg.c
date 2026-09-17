@@ -45,6 +45,7 @@
 #include <turbojpeg.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <string.h>
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -800,6 +801,38 @@ uvc_error_t uvc_mjpeg2yuv_planar(uvc_frame_t *in, uvc_frame_t *out) {
 			in->actual_bytes,
 			tj3GetErrorStr(tj));
 		return UVC_ERROR_OTHER;
+	}
+	{
+		/* libjpeg warnings after a "successful" decode mean the bitstream was
+		 * damaged: a few bytes inserted or dropped desyncs the Huffman decoder
+		 * with no restart markers, so the top decodes and everything below is
+		 * shredded, ending in "premature end" (bytes missing) or "N extraneous
+		 * bytes before marker" (bytes inserted).  Both were observed on a MUSB
+		 * USB 2.0 host; drop such frames so the last good one stays on glass.
+		 * Some cameras pad every frame and warn every time; if warnings become
+		 * continuous (>= 60 in a row) we assume that and stop dropping until a
+		 * clean frame is seen again. */
+		static uint32_t s_warning_drops, s_consecutive_warnings;
+		static int s_tolerate_logged;
+		const int warned = tj3GetErrorCode(tj) == TJERR_WARNING;
+		if (!warned) {
+			s_consecutive_warnings = 0;
+			s_tolerate_logged = 0;
+		} else if (s_consecutive_warnings >= 60) {
+			if (!s_tolerate_logged) {
+				s_tolerate_logged = 1;
+				LOGW("mjpeg planar decode: every frame warns (%s); treating as benign padding",
+					tj3GetErrorStr(tj));
+			}
+		} else {
+			const char *msg = tj3GetErrorStr(tj);
+			s_consecutive_warnings++;
+			s_warning_drops++;
+			if (s_warning_drops <= 5 || !(s_warning_drops % 300))
+				LOGW("mjpeg planar decode dropped corrupt frame count=%u seq=%u bytes=%zu warn=%s",
+					s_warning_drops, in->sequence, in->actual_bytes, msg ? msg : "?");
+			return UVC_ERROR_OTHER;
+		}
 	}
 
 	out->width = in->width;
