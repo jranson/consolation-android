@@ -265,6 +265,10 @@ enum ProgramKind {
 	PROGRAM_COUNT
 };
 
+/* Re-query the EGL surface size this often (frames); it only changes on a
+ * geometry change, which also resets the surface in practice. */
+static const uint32_t SURFACE_SIZE_REFRESH_FRAMES = 64;
+
 static GLuint compile_shader(GLenum type, const char *src)
 {
 	GLuint shader = glCreateShader(type);
@@ -317,21 +321,42 @@ static size_t frame_actual_bytes(const uvc_frame_t *frame)
 } // namespace
 
 struct UVCGpuPreviewRenderer::Impl {
+	/* Uniform locations resolved once at link time (glGetUniformLocation is a
+	 * string lookup in the driver; it was being done ~8x per frame). -1 = absent. */
+	struct Uniforms {
+		GLint tex0 = -1, tex1 = -1, tex2 = -1;
+		GLint width = -1, height = -1;
+		GLint chromaWidth = -1, chromaHeight = -1, gray = -1, uyvy = -1;
+		GLint storageWidth = -1, format = -1;
+	};
+
 	EGLDisplay display = EGL_NO_DISPLAY;
 	EGLContext context = EGL_NO_CONTEXT;
 	EGLSurface surface = EGL_NO_SURFACE;
 	EGLConfig config = nullptr;
 	ANativeWindow *window = nullptr;
 	GLuint programs[PROGRAM_COUNT] = {};
+	Uniforms uniforms[PROGRAM_COUNT];
 	GLuint textures[3] = {};
-	int mjpegTextureWidths[3] = {};
-	int mjpegTextureHeights[3] = {};
+	/* Storage spec currently allocated for each of the 3 texture units, so the
+	 * steady state is one glTexSubImage2D per plane (no re-specification). */
+	int texWidth[3] = {};
+	int texHeight[3] = {};
+	GLenum texInternal[3] = {};
+	GLint texFilter[3] = {};
 	GLuint hardwareTexture = 0;
 	EGLImageKHR hardwareImage = EGL_NO_IMAGE_KHR;
 	void *hardwareBuffer = nullptr;
 	GLuint vbo = 0;
+	GLuint vao = 0;
 	int surface_width = 0;
 	int surface_height = 0;
+	uint32_t frames_since_size_query = 0;
+	/* EGL/GLES extension entry points, resolved once per EGL init. */
+	PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC pGetNativeClientBuffer = nullptr;
+	PFNEGLCREATEIMAGEKHRPROC pCreateImage = nullptr;
+	PFNEGLDESTROYIMAGEKHRPROC pDestroyImage = nullptr;
+	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC pImageTargetTexture = nullptr;
 
 	bool ensureEgl(ANativeWindow *target);
 	bool ensureSurface(ANativeWindow *target);
@@ -339,18 +364,13 @@ struct UVCGpuPreviewRenderer::Impl {
 	void destroyGl();
 	GLuint program(ProgramKind kind);
 	void setupGeometry();
+	void refreshSurfaceSize(bool force);
+	void drawQuad();
 	bool drawHardwareBuffer(uvc_frame_t *frame);
 	bool uploadAndDraw(uvc_frame_t *frame);
-	void resetMjpegTextureStorage();
-	bool uploadR8(GLuint tex, int width, int height, const void *data);
-	bool uploadR8Stride(GLuint tex, int width, int height, int stride,
-		const void *data);
-	bool uploadMjpegPlane(int plane, int width, int height, int stride,
-		const void *data);
-	bool uploadRG8(GLuint tex, int width, int height, const void *data);
-	bool uploadRGB8(GLuint tex, int width, int height, const void *data);
-	bool uploadR16UI(GLuint tex, int width, int height, const void *data);
-	bool uploadRG16UI(GLuint tex, int width, int height, const void *data);
+	void resetTextureStorage();
+	bool uploadTexture(int unit, GLenum internal, GLenum format, GLenum type,
+		GLint filter, int width, int height, int stride_px, const void *data);
 };
 
 UVCGpuPreviewRenderer::UVCGpuPreviewRenderer()
@@ -464,6 +484,13 @@ bool UVCGpuPreviewRenderer::Impl::ensureEgl(ANativeWindow *target)
 		return false;
 	}
 
+	pGetNativeClientBuffer = (PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC)
+		eglGetProcAddress("eglGetNativeClientBufferANDROID");
+	pCreateImage = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+	pDestroyImage = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+	pImageTargetTexture = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)
+		eglGetProcAddress("glEGLImageTargetTexture2DOES");
+
 	(void)target;
 	return true;
 }
@@ -487,7 +514,9 @@ bool UVCGpuPreviewRenderer::Impl::ensureSurface(ANativeWindow *target)
 	}
 	eglSwapInterval(display, 0);
 	glGenTextures(3, textures);
+	resetTextureStorage();
 	setupGeometry();
+	refreshSurfaceSize(true);
 	return true;
 }
 
@@ -499,19 +528,21 @@ void UVCGpuPreviewRenderer::Impl::destroySurface()
 	if (textures[0] || textures[1] || textures[2]) {
 		glDeleteTextures(3, textures);
 		memset(textures, 0, sizeof(textures));
-		resetMjpegTextureStorage();
+		resetTextureStorage();
 	}
 	if (hardwareImage != EGL_NO_IMAGE_KHR) {
-		PFNEGLDESTROYIMAGEKHRPROC destroyImage =
-			(PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
-		if (destroyImage)
-			destroyImage(display, hardwareImage);
+		if (pDestroyImage)
+			pDestroyImage(display, hardwareImage);
 		hardwareImage = EGL_NO_IMAGE_KHR;
 		hardwareBuffer = nullptr;
 	}
 	if (hardwareTexture) {
 		glDeleteTextures(1, &hardwareTexture);
 		hardwareTexture = 0;
+	}
+	if (vao) {
+		glDeleteVertexArrays(1, &vao);
+		vao = 0;
 	}
 	if (vbo) {
 		glDeleteBuffers(1, &vbo);
@@ -536,12 +567,17 @@ void UVCGpuPreviewRenderer::Impl::destroyGl()
 			glDeleteProgram(programs[i]);
 			programs[i] = 0;
 		}
+		uniforms[i] = Uniforms();
 	}
 	if (display != EGL_NO_DISPLAY && context != EGL_NO_CONTEXT) {
 		eglDestroyContext(display, context);
 		context = EGL_NO_CONTEXT;
 	}
 	config = nullptr;
+	pGetNativeClientBuffer = nullptr;
+	pCreateImage = nullptr;
+	pDestroyImage = nullptr;
+	pImageTargetTexture = nullptr;
 }
 
 GLuint UVCGpuPreviewRenderer::Impl::program(ProgramKind kind)
@@ -575,35 +611,88 @@ GLuint UVCGpuPreviewRenderer::Impl::program(ProgramKind kind)
 	default:
 		return 0;
 	}
-	programs[kind] = link_program(src);
-	return programs[kind];
+	const GLuint prog = link_program(src);
+	programs[kind] = prog;
+	if (!prog)
+		return 0;
+
+	/* Resolve every uniform this program might declare; absent ones are -1 and
+	 * glUniform1i(-1, ...) is a defined no-op.  Sampler bindings never change,
+	 * so set them once here. */
+	Uniforms &u = uniforms[kind];
+	static const char *tex0_names[PROGRAM_COUNT] = {
+		"uPacked", "uY", "uY", "uY", "uBgr", "uY16", "uStorage" };
+	static const char *tex1_names[PROGRAM_COUNT] = {
+		nullptr, "uUV", "uU", "uU", nullptr, "uUV16", nullptr };
+	static const char *tex2_names[PROGRAM_COUNT] = {
+		nullptr, nullptr, "uV", "uV", nullptr, nullptr, nullptr };
+	u.tex0 = tex0_names[kind] ? glGetUniformLocation(prog, tex0_names[kind]) : -1;
+	u.tex1 = tex1_names[kind] ? glGetUniformLocation(prog, tex1_names[kind]) : -1;
+	u.tex2 = tex2_names[kind] ? glGetUniformLocation(prog, tex2_names[kind]) : -1;
+	u.width = glGetUniformLocation(prog, "uWidth");
+	u.height = glGetUniformLocation(prog, "uHeight");
+	u.chromaWidth = glGetUniformLocation(prog, "uChromaWidth");
+	u.chromaHeight = glGetUniformLocation(prog, "uChromaHeight");
+	u.gray = glGetUniformLocation(prog, "uGray");
+	u.uyvy = glGetUniformLocation(prog, "uUyvy");
+	u.storageWidth = glGetUniformLocation(prog, "uStorageWidth");
+	u.format = glGetUniformLocation(prog, "uFormat");
+	glUseProgram(prog);
+	glUniform1i(u.tex0, 0);
+	glUniform1i(u.tex1, 1);
+	glUniform1i(u.tex2, 2);
+	return prog;
 }
 
 void UVCGpuPreviewRenderer::Impl::setupGeometry()
 {
 	if (!vbo)
 		glGenBuffers(1, &vbo);
+	if (!vao)
+		glGenVertexArrays(1, &vao);
 	static const GLfloat vertices[] = {
 		-1.0f,  1.0f, 0.0f, 0.0f,
 		-1.0f, -1.0f, 0.0f, 1.0f,
 		 1.0f,  1.0f, 1.0f, 0.0f,
 		 1.0f, -1.0f, 1.0f, 1.0f,
 	};
+	/* Vertex layout is captured in the VAO once; per frame it is one bind. */
+	glBindVertexArray(vao);
 	glBindBuffer(GL_ARRAY_BUFFER, vbo);
 	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+	glEnableVertexAttribArray(0);
+	glEnableVertexAttribArray(1);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void *)0);
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
+		(const void *)(2 * sizeof(GLfloat)));
+	glBindVertexArray(0);
+}
+
+void UVCGpuPreviewRenderer::Impl::refreshSurfaceSize(bool force)
+{
+	if (!force && ++frames_since_size_query < SURFACE_SIZE_REFRESH_FRAMES)
+		return;
+	frames_since_size_query = 0;
+	EGLint sw = 0;
+	EGLint sh = 0;
+	eglQuerySurface(display, surface, EGL_WIDTH, &sw);
+	eglQuerySurface(display, surface, EGL_HEIGHT, &sh);
+	surface_width = sw;
+	surface_height = sh;
+}
+
+void UVCGpuPreviewRenderer::Impl::drawQuad()
+{
+	refreshSurfaceSize(false);
+	glViewport(0, 0, surface_width, surface_height);
+	glBindVertexArray(vao);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glBindVertexArray(0);
 }
 
 bool UVCGpuPreviewRenderer::Impl::drawHardwareBuffer(uvc_frame_t *frame)
 {
-	PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC getNativeClientBuffer =
-		(PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC)eglGetProcAddress(
-			"eglGetNativeClientBufferANDROID");
-	PFNEGLCREATEIMAGEKHRPROC createImage =
-		(PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
-	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC imageTargetTexture =
-		(PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress(
-			"glEGLImageTargetTexture2DOES");
-	if (!getNativeClientBuffer || !createImage || !imageTargetTexture)
+	if (!pGetNativeClientBuffer || !pCreateImage || !pImageTargetTexture)
 		return false;
 
 	AHardwareBuffer_Desc desc;
@@ -620,17 +709,15 @@ bool UVCGpuPreviewRenderer::Impl::drawHardwareBuffer(uvc_frame_t *frame)
 	do {
 		if (hardwareBuffer != frame->library_hardware_buffer) {
 			if (hardwareImage != EGL_NO_IMAGE_KHR) {
-				PFNEGLDESTROYIMAGEKHRPROC destroyImage =
-					(PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
-				if (destroyImage)
-					destroyImage(display, hardwareImage);
+				if (pDestroyImage)
+					pDestroyImage(display, hardwareImage);
 				hardwareImage = EGL_NO_IMAGE_KHR;
 			}
-			EGLClientBuffer clientBuffer = getNativeClientBuffer(
+			EGLClientBuffer clientBuffer = pGetNativeClientBuffer(
 				(AHardwareBuffer *)frame->library_hardware_buffer);
 			if (!clientBuffer)
 				break;
-			hardwareImage = createImage(display, EGL_NO_CONTEXT,
+			hardwareImage = pCreateImage(display, EGL_NO_CONTEXT,
 				EGL_NATIVE_BUFFER_ANDROID, clientBuffer, NULL);
 			if (hardwareImage == EGL_NO_IMAGE_KHR) {
 				LOGW("gpu-preview: eglCreateImageKHR(AHB) failed err=0x%x",
@@ -640,41 +727,31 @@ bool UVCGpuPreviewRenderer::Impl::drawHardwareBuffer(uvc_frame_t *frame)
 			hardwareBuffer = frame->library_hardware_buffer;
 		}
 
-		if (!hardwareTexture)
+		if (!hardwareTexture) {
 			glGenTextures(1, &hardwareTexture);
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, hardwareTexture);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		imageTargetTexture(GL_TEXTURE_2D, hardwareImage);
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, hardwareTexture);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		} else {
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, hardwareTexture);
+		}
+		pImageTargetTexture(GL_TEXTURE_2D, hardwareImage);
 
 		GLuint prog = program(PROGRAM_HARDWARE_LINEAR);
 		if (!prog)
 			break;
+		const Uniforms &u = uniforms[PROGRAM_HARDWARE_LINEAR];
 		glUseProgram(prog);
-		glUniform1i(glGetUniformLocation(prog, "uStorage"), 0);
-		glUniform1i(glGetUniformLocation(prog, "uWidth"), (int)frame->width);
-		glUniform1i(glGetUniformLocation(prog, "uHeight"), (int)frame->height);
-		glUniform1i(glGetUniformLocation(prog, "uStorageWidth"), (int)desc.width);
-		glUniform1i(glGetUniformLocation(prog, "uFormat"), (int)frame->frame_format);
+		glUniform1i(u.width, (int)frame->width);
+		glUniform1i(u.height, (int)frame->height);
+		glUniform1i(u.storageWidth, (int)desc.width);
+		glUniform1i(u.format, (int)frame->frame_format);
 
-		EGLint sw = 0;
-		EGLint sh = 0;
-		eglQuerySurface(display, surface, EGL_WIDTH, &sw);
-		eglQuerySurface(display, surface, EGL_HEIGHT, &sh);
-		glViewport(0, 0, sw, sh);
-		glBindBuffer(GL_ARRAY_BUFFER, vbo);
-		glEnableVertexAttribArray(0);
-		glEnableVertexAttribArray(1);
-		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
-			(const void *)0);
-		glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
-			(const void *)(2 * sizeof(GLfloat)));
-		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-		glDisableVertexAttribArray(0);
-		glDisableVertexAttribArray(1);
+		drawQuad();
 
 		const GLenum err = glGetError();
 		if (err != GL_NO_ERROR) {
@@ -693,114 +770,49 @@ bool UVCGpuPreviewRenderer::Impl::drawHardwareBuffer(uvc_frame_t *frame)
 	return ok;
 }
 
-void UVCGpuPreviewRenderer::Impl::resetMjpegTextureStorage()
+void UVCGpuPreviewRenderer::Impl::resetTextureStorage()
 {
-	memset(mjpegTextureWidths, 0, sizeof(mjpegTextureWidths));
-	memset(mjpegTextureHeights, 0, sizeof(mjpegTextureHeights));
+	memset(texWidth, 0, sizeof(texWidth));
+	memset(texHeight, 0, sizeof(texHeight));
+	memset(texInternal, 0, sizeof(texInternal));
+	memset(texFilter, 0, sizeof(texFilter));
 }
 
-bool UVCGpuPreviewRenderer::Impl::uploadR8(GLuint tex, int width, int height,
-	const void *data)
+/* Upload one plane into texture unit `unit`.  Storage is (re)specified with
+ * glTexImage2D only when the size, internal format, or filter changes; the
+ * steady state is a single glTexSubImage2D, which lets the driver reuse the
+ * existing allocation instead of orphaning it every frame. */
+bool UVCGpuPreviewRenderer::Impl::uploadTexture(int unit, GLenum internal,
+	GLenum format, GLenum type, GLint filter, int width, int height,
+	int stride_px, const void *data)
 {
-	glBindTexture(GL_TEXTURE_2D, tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED,
-		GL_UNSIGNED_BYTE, data);
-	return glGetError() == GL_NO_ERROR;
-}
-
-bool UVCGpuPreviewRenderer::Impl::uploadR8Stride(GLuint tex, int width, int height,
-	int stride, const void *data)
-{
-	glPixelStorei(GL_UNPACK_ROW_LENGTH, stride > width ? stride : 0);
-	const bool ok = uploadR8(tex, width, height, data);
-	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-	return ok;
-}
-
-bool UVCGpuPreviewRenderer::Impl::uploadMjpegPlane(int plane, int width,
-	int height, int stride, const void *data)
-{
-	if (plane < 0 || plane >= 3 || width <= 0 || height <= 0 || !data)
+	if (unit < 0 || unit >= 3 || width <= 0 || height <= 0 || !data)
 		return false;
-
-	GLuint tex = textures[plane];
-	glBindTexture(GL_TEXTURE_2D, tex);
-	if (mjpegTextureWidths[plane] != width || mjpegTextureHeights[plane] != height) {
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glActiveTexture(GL_TEXTURE0 + unit);
+	glBindTexture(GL_TEXTURE_2D, textures[unit]);
+	if (texWidth[unit] != width || texHeight[unit] != height
+			|| texInternal[unit] != internal || texFilter[unit] != filter) {
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED,
-			GL_UNSIGNED_BYTE, NULL);
+		glTexImage2D(GL_TEXTURE_2D, 0, (GLint)internal, width, height, 0, format,
+			type, NULL);
 		if (glGetError() != GL_NO_ERROR) {
-			mjpegTextureWidths[plane] = 0;
-			mjpegTextureHeights[plane] = 0;
+			texWidth[unit] = 0;
+			texHeight[unit] = 0;
+			texInternal[unit] = 0;
+			texFilter[unit] = 0;
 			return false;
 		}
-		mjpegTextureWidths[plane] = width;
-		mjpegTextureHeights[plane] = height;
+		texWidth[unit] = width;
+		texHeight[unit] = height;
+		texInternal[unit] = internal;
+		texFilter[unit] = filter;
 	}
-
-	glPixelStorei(GL_UNPACK_ROW_LENGTH, stride > width ? stride : 0);
-	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED,
-		GL_UNSIGNED_BYTE, data);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, stride_px > width ? stride_px : 0);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, format, type, data);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-	return glGetError() == GL_NO_ERROR;
-}
-
-bool UVCGpuPreviewRenderer::Impl::uploadRG8(GLuint tex, int width, int height,
-	const void *data)
-{
-	glBindTexture(GL_TEXTURE_2D, tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, width, height, 0, GL_RG,
-		GL_UNSIGNED_BYTE, data);
-	return glGetError() == GL_NO_ERROR;
-}
-
-bool UVCGpuPreviewRenderer::Impl::uploadRGB8(GLuint tex, int width, int height,
-	const void *data)
-{
-	glBindTexture(GL_TEXTURE_2D, tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB,
-		GL_UNSIGNED_BYTE, data);
-	return glGetError() == GL_NO_ERROR;
-}
-
-bool UVCGpuPreviewRenderer::Impl::uploadR16UI(GLuint tex, int width, int height,
-	const void *data)
-{
-	glBindTexture(GL_TEXTURE_2D, tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_R16UI, width, height, 0, GL_RED_INTEGER,
-		GL_UNSIGNED_SHORT, data);
-	return glGetError() == GL_NO_ERROR;
-}
-
-bool UVCGpuPreviewRenderer::Impl::uploadRG16UI(GLuint tex, int width, int height,
-	const void *data)
-{
-	glBindTexture(GL_TEXTURE_2D, tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RG16UI, width, height, 0, GL_RG_INTEGER,
-		GL_UNSIGNED_SHORT, data);
 	return glGetError() == GL_NO_ERROR;
 }
 
@@ -810,10 +822,9 @@ bool UVCGpuPreviewRenderer::Impl::uploadAndDraw(uvc_frame_t *frame)
 	const int height = (int)frame->height;
 	if (width <= 0 || height <= 0)
 		return false;
-	if (frame->frame_format != UVC_FRAME_FORMAT_MJPEG_YUV_PLANAR)
-		resetMjpegTextureStorage();
 
 	GLuint prog = 0;
+	ProgramKind kind = PROGRAM_COUNT;
 	const uint8_t *data = (const uint8_t *)frame->data;
 	const size_t actual = frame_actual_bytes(frame);
 
@@ -824,16 +835,15 @@ bool UVCGpuPreviewRenderer::Impl::uploadAndDraw(uvc_frame_t *frame)
 		const size_t need = (size_t)width * (size_t)height * 2u;
 		if (actual < need)
 			return false;
-		prog = program(PROGRAM_YUYV);
-		if (!prog || !uploadR8(textures[0], width * 2, height, data))
+		kind = PROGRAM_YUYV;
+		prog = program(kind);
+		if (!prog || !uploadTexture(0, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_NEAREST,
+				width * 2, height, 0, data))
 			return false;
 		glUseProgram(prog);
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, textures[0]);
-		glUniform1i(glGetUniformLocation(prog, "uPacked"), 0);
-		glUniform1i(glGetUniformLocation(prog, "uWidth"), width);
-		glUniform1i(glGetUniformLocation(prog, "uHeight"), height);
-		glUniform1i(glGetUniformLocation(prog, "uUyvy"),
+		glUniform1i(uniforms[kind].width, width);
+		glUniform1i(uniforms[kind].height, height);
+		glUniform1i(uniforms[kind].uyvy,
 			frame->frame_format == UVC_FRAME_FORMAT_UYVY ? 1 : 0);
 		break;
 	}
@@ -842,20 +852,17 @@ bool UVCGpuPreviewRenderer::Impl::uploadAndDraw(uvc_frame_t *frame)
 		const size_t need = y_bytes + y_bytes / 2u;
 		if (actual < need || (width & 1) || (height & 1))
 			return false;
-		prog = program(PROGRAM_NV12);
+		kind = PROGRAM_NV12;
+		prog = program(kind);
 		if (!prog
-			|| !uploadR8(textures[0], width, height, data)
-			|| !uploadRG8(textures[1], width / 2, height / 2, data + y_bytes))
+			|| !uploadTexture(0, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_NEAREST,
+				width, height, 0, data)
+			|| !uploadTexture(1, GL_RG8, GL_RG, GL_UNSIGNED_BYTE, GL_NEAREST,
+				width / 2, height / 2, 0, data + y_bytes))
 			return false;
 		glUseProgram(prog);
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, textures[0]);
-		glUniform1i(glGetUniformLocation(prog, "uY"), 0);
-		glActiveTexture(GL_TEXTURE1);
-		glBindTexture(GL_TEXTURE_2D, textures[1]);
-		glUniform1i(glGetUniformLocation(prog, "uUV"), 1);
-		glUniform1i(glGetUniformLocation(prog, "uWidth"), width);
-		glUniform1i(glGetUniformLocation(prog, "uHeight"), height);
+		glUniform1i(uniforms[kind].width, width);
+		glUniform1i(uniforms[kind].height, height);
 		break;
 	}
 	case UVC_FRAME_FORMAT_YU12: {
@@ -864,25 +871,19 @@ bool UVCGpuPreviewRenderer::Impl::uploadAndDraw(uvc_frame_t *frame)
 		const size_t need = y_bytes + chroma_bytes * 2u;
 		if (actual < need || (width & 1) || (height & 1))
 			return false;
-		prog = program(PROGRAM_YU12);
+		kind = PROGRAM_YU12;
+		prog = program(kind);
 		if (!prog
-			|| !uploadR8(textures[0], width, height, data)
-			|| !uploadR8(textures[1], width / 2, height / 2, data + y_bytes)
-			|| !uploadR8(textures[2], width / 2, height / 2,
-				data + y_bytes + chroma_bytes))
+			|| !uploadTexture(0, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_NEAREST,
+				width, height, 0, data)
+			|| !uploadTexture(1, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_NEAREST,
+				width / 2, height / 2, 0, data + y_bytes)
+			|| !uploadTexture(2, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_NEAREST,
+				width / 2, height / 2, 0, data + y_bytes + chroma_bytes))
 			return false;
 		glUseProgram(prog);
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, textures[0]);
-		glUniform1i(glGetUniformLocation(prog, "uY"), 0);
-		glActiveTexture(GL_TEXTURE1);
-		glBindTexture(GL_TEXTURE_2D, textures[1]);
-		glUniform1i(glGetUniformLocation(prog, "uU"), 1);
-		glActiveTexture(GL_TEXTURE2);
-		glBindTexture(GL_TEXTURE_2D, textures[2]);
-		glUniform1i(glGetUniformLocation(prog, "uV"), 2);
-		glUniform1i(glGetUniformLocation(prog, "uWidth"), width);
-		glUniform1i(glGetUniformLocation(prog, "uHeight"), height);
+		glUniform1i(uniforms[kind].width, width);
+		glUniform1i(uniforms[kind].height, height);
 		break;
 	}
 	case UVC_FRAME_FORMAT_MJPEG_YUV_PLANAR: {
@@ -891,21 +892,22 @@ bool UVCGpuPreviewRenderer::Impl::uploadAndDraw(uvc_frame_t *frame)
 		if (actual < frame->actual_bytes || !frame->yuv_plane_widths[0]
 				|| !frame->yuv_plane_heights[0])
 			return false;
-		prog = program(PROGRAM_MJPEG_PLANAR);
+		kind = PROGRAM_MJPEG_PLANAR;
+		prog = program(kind);
 		if (!prog
-			|| !uploadMjpegPlane(0,
+			|| !uploadTexture(0, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_NEAREST,
 				(int)frame->yuv_plane_widths[0],
 				(int)frame->yuv_plane_heights[0],
 				(int)frame->yuv_plane_strides[0],
 				data + frame->yuv_plane_offsets[0]))
 			return false;
 		if (!gray) {
-			if (!uploadMjpegPlane(1,
+			if (!uploadTexture(1, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_NEAREST,
 					(int)frame->yuv_plane_widths[1],
 					(int)frame->yuv_plane_heights[1],
 					(int)frame->yuv_plane_strides[1],
 					data + frame->yuv_plane_offsets[1])
-					|| !uploadMjpegPlane(2,
+					|| !uploadTexture(2, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_NEAREST,
 					(int)frame->yuv_plane_widths[2],
 					(int)frame->yuv_plane_heights[2],
 					(int)frame->yuv_plane_strides[2],
@@ -913,35 +915,25 @@ bool UVCGpuPreviewRenderer::Impl::uploadAndDraw(uvc_frame_t *frame)
 				return false;
 		}
 		glUseProgram(prog);
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, textures[0]);
-		glUniform1i(glGetUniformLocation(prog, "uY"), 0);
-		glActiveTexture(GL_TEXTURE1);
-		glBindTexture(GL_TEXTURE_2D, textures[1]);
-		glUniform1i(glGetUniformLocation(prog, "uU"), 1);
-		glActiveTexture(GL_TEXTURE2);
-		glBindTexture(GL_TEXTURE_2D, textures[2]);
-		glUniform1i(glGetUniformLocation(prog, "uV"), 2);
-		glUniform1i(glGetUniformLocation(prog, "uWidth"), width);
-		glUniform1i(glGetUniformLocation(prog, "uHeight"), height);
-		glUniform1i(glGetUniformLocation(prog, "uChromaWidth"),
+		glUniform1i(uniforms[kind].width, width);
+		glUniform1i(uniforms[kind].height, height);
+		glUniform1i(uniforms[kind].chromaWidth,
 			gray ? 1 : (int)frame->yuv_plane_widths[1]);
-		glUniform1i(glGetUniformLocation(prog, "uChromaHeight"),
+		glUniform1i(uniforms[kind].chromaHeight,
 			gray ? 1 : (int)frame->yuv_plane_heights[1]);
-		glUniform1i(glGetUniformLocation(prog, "uGray"), gray ? 1 : 0);
+		glUniform1i(uniforms[kind].gray, gray ? 1 : 0);
 		break;
 	}
 	case UVC_FRAME_FORMAT_BGR: {
 		const size_t need = (size_t)width * (size_t)height * 3u;
 		if (actual < need)
 			return false;
-		prog = program(PROGRAM_BGR);
-		if (!prog || !uploadRGB8(textures[0], width, height, data))
+		kind = PROGRAM_BGR;
+		prog = program(kind);
+		if (!prog || !uploadTexture(0, GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, GL_LINEAR,
+				width, height, 0, data))
 			return false;
 		glUseProgram(prog);
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, textures[0]);
-		glUniform1i(glGetUniformLocation(prog, "uBgr"), 0);
 		break;
 	}
 	case UVC_FRAME_FORMAT_P010: {
@@ -949,40 +941,24 @@ bool UVCGpuPreviewRenderer::Impl::uploadAndDraw(uvc_frame_t *frame)
 		const size_t need = y_bytes + y_bytes / 2u;
 		if (actual < need || (width & 1) || (height & 1))
 			return false;
-		prog = program(PROGRAM_P010);
+		kind = PROGRAM_P010;
+		prog = program(kind);
 		if (!prog
-			|| !uploadR16UI(textures[0], width, height, data)
-			|| !uploadRG16UI(textures[1], width / 2, height / 2, data + y_bytes))
+			|| !uploadTexture(0, GL_R16UI, GL_RED_INTEGER, GL_UNSIGNED_SHORT, GL_NEAREST,
+				width, height, 0, data)
+			|| !uploadTexture(1, GL_RG16UI, GL_RG_INTEGER, GL_UNSIGNED_SHORT, GL_NEAREST,
+				width / 2, height / 2, 0, data + y_bytes))
 			return false;
 		glUseProgram(prog);
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, textures[0]);
-		glUniform1i(glGetUniformLocation(prog, "uY16"), 0);
-		glActiveTexture(GL_TEXTURE1);
-		glBindTexture(GL_TEXTURE_2D, textures[1]);
-		glUniform1i(glGetUniformLocation(prog, "uUV16"), 1);
-		glUniform1i(glGetUniformLocation(prog, "uWidth"), width);
-		glUniform1i(glGetUniformLocation(prog, "uHeight"), height);
+		glUniform1i(uniforms[kind].width, width);
+		glUniform1i(uniforms[kind].height, height);
 		break;
 	}
 	default:
 		return false;
 	}
 
-	EGLint sw = 0;
-	EGLint sh = 0;
-	eglQuerySurface(display, surface, EGL_WIDTH, &sw);
-	eglQuerySurface(display, surface, EGL_HEIGHT, &sh);
-	glViewport(0, 0, sw, sh);
-	glBindBuffer(GL_ARRAY_BUFFER, vbo);
-	glEnableVertexAttribArray(0);
-	glEnableVertexAttribArray(1);
-	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void *)0);
-	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
-		(const void *)(2 * sizeof(GLfloat)));
-	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-	glDisableVertexAttribArray(0);
-	glDisableVertexAttribArray(1);
+	drawQuad();
 
 	const GLenum err = glGetError();
 	if (err != GL_NO_ERROR) {

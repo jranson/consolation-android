@@ -89,6 +89,14 @@ private:
 	pthread_mutex_t mjpeg_decode_mutex;
 	pthread_cond_t mjpeg_decode_sync;
 	BoundedPointerRing<uvc_frame_t *> mjpeg_decode_frame_ring;
+	/** Fixed pool of frame headers handed to the async MJPEG decoder (ring depth
+	 * + one in flight on each side).  Replaces a malloc/free pair per frame. */
+#define MJPEG_HEADER_POOL_SZ (MJPEG_DECODE_QUEUE_MAX + 2)
+	uvc_frame_t mjpeg_header_slots[MJPEG_HEADER_POOL_SZ];
+	bool mjpeg_header_used[MJPEG_HEADER_POOL_SZ];
+	uvc_frame_t *mjpeg_header_get();
+	void mjpeg_header_put_locked(uvc_frame_t *header);
+	void mjpeg_header_put(uvc_frame_t *header);
 	int previewFormat;
 	size_t previewBytes;
 //

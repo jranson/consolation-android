@@ -330,7 +330,40 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	pthread_mutex_init(&pool_mutex, NULL);
 	iframecallback_fields.onFrame = nullptr;
 	preview_iframecallback_fields.onFrame = nullptr;
+	memset(mjpeg_header_slots, 0, sizeof(mjpeg_header_slots));
+	memset(mjpeg_header_used, 0, sizeof(mjpeg_header_used));
 	EXIT();
+}
+
+uvc_frame_t *UVCPreview::mjpeg_header_get() {
+	uvc_frame_t *header = NULL;
+	pthread_mutex_lock(&mjpeg_decode_mutex);
+	for (int i = 0; i < MJPEG_HEADER_POOL_SZ; i++) {
+		if (!mjpeg_header_used[i]) {
+			mjpeg_header_used[i] = true;
+			header = &mjpeg_header_slots[i];
+			break;
+		}
+	}
+	pthread_mutex_unlock(&mjpeg_decode_mutex);
+	return header;
+}
+
+void UVCPreview::mjpeg_header_put_locked(uvc_frame_t *header) {
+	if (!header)
+		return;
+	const ptrdiff_t i = header - mjpeg_header_slots;
+	if (LIKELY(i >= 0 && i < MJPEG_HEADER_POOL_SZ)) {
+		mjpeg_header_used[i] = false;
+	} else {
+		LOGW("mjpeg_header_put: foreign frame header %p", header);
+	}
+}
+
+void UVCPreview::mjpeg_header_put(uvc_frame_t *header) {
+	pthread_mutex_lock(&mjpeg_decode_mutex);
+	mjpeg_header_put_locked(header);
+	pthread_mutex_unlock(&mjpeg_decode_mutex);
 }
 
 UVCPreview::~UVCPreview() {
@@ -1227,11 +1260,15 @@ void UVCPreview::addMjpegDecodeFrame(uvc_frame_t *frame) {
 	if (UNLIKELY(!frame))
 		return;
 
-	uvc_frame_t *queued = uvc_allocate_frame(0);
-	if (UNLIKELY(!queued))
-		return;
 	/* Stage 1: USB-thread publish -> libuvc callback thread. */
 	if (UNLIKELY(!frame_integrity_ok(frame, "publish->callback", g_integrity_mismatch_cb))) {
+		processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	uvc_frame_t *queued = mjpeg_header_get();
+	if (UNLIKELY(!queued)) {
+		/* Pool exhausted: ring full plus both in-flight slots busy.  The ring's
+		 * drop-oldest would have evicted anyway; count it as a queue drop. */
 		processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
@@ -1241,7 +1278,7 @@ void UVCPreview::addMjpegDecodeFrame(uvc_frame_t *frame) {
 		/* No slot reference: the bytes could be overwritten by the USB thread
 		 * while the decoder reads them. Never hand such a frame to the async
 		 * decoder (sequential overwrite shows as a shredded lower half). */
-		uvc_free_frame(queued);
+		mjpeg_header_put(queued);
 		return;
 	}
 	pthread_mutex_lock(&mjpeg_decode_mutex);
@@ -1250,7 +1287,7 @@ void UVCPreview::addMjpegDecodeFrame(uvc_frame_t *frame) {
 		if (drop) {
 			processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
 			uvc_frame_release(drop);
-			uvc_free_frame(drop);
+			mjpeg_header_put_locked(drop);
 		}
 		queued = NULL;
 		pthread_cond_signal(&mjpeg_decode_sync);
@@ -1258,7 +1295,7 @@ void UVCPreview::addMjpegDecodeFrame(uvc_frame_t *frame) {
 	pthread_mutex_unlock(&mjpeg_decode_mutex);
 	if (queued) {
 		uvc_frame_release(queued);
-		uvc_free_frame(queued);
+		mjpeg_header_put(queued);
 	}
 }
 
@@ -1280,7 +1317,7 @@ void UVCPreview::clearMjpegDecodeFrame() {
 	while (!mjpeg_decode_frame_ring.empty()) {
 		uvc_frame_t *frame = mjpeg_decode_frame_ring.dequeue();
 		uvc_frame_release(frame);
-		uvc_free_frame(frame);
+		mjpeg_header_put_locked(frame);
 	}
 	mjpeg_decode_frame_ring.reset_storage();
 	pthread_mutex_unlock(&mjpeg_decode_mutex);
@@ -1306,7 +1343,7 @@ void UVCPreview::do_mjpeg_decode() {
 		if (UNLIKELY(!frame_integrity_ok(frame, "callback->decode", g_integrity_mismatch_decode))) {
 			processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
 			uvc_frame_release(frame);
-			uvc_free_frame(frame);
+			mjpeg_header_put(frame);
 			continue;
 		}
 		debug_mjpeg_dump_maybe(frame);
@@ -1323,7 +1360,7 @@ void UVCPreview::do_mjpeg_decode() {
 					recycle_frame(decoded);
 					decoded = NULL;
 					uvc_frame_release(frame);
-					uvc_free_frame(frame);
+					mjpeg_header_put(frame);
 					continue;
 				}
 #if UVC_FRAME_INTEGRITY_CHECK
@@ -1347,7 +1384,7 @@ void UVCPreview::do_mjpeg_decode() {
 		if (decoded)
 			recycle_frame(decoded);
 		uvc_frame_release(frame);
-		uvc_free_frame(frame);
+		mjpeg_header_put(frame);
 	}
 }
 

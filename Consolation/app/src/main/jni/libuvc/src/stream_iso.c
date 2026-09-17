@@ -13,6 +13,7 @@
  #include <unistd.h>
  #include <string.h>
  
+ #include <libusb/libusb_prealloc.h>
  #include "libuvc/stream_log.h"
  #include "libuvc/libuvc.h"
  #include "libuvc/libuvc_internal.h"
@@ -534,7 +535,15 @@ static unsigned int _uvc_iso_host_packet_cap(uvc_stream_handle_t *strmh) {
 			 (void *)strmh,
 			 LIBUVC_STREAM_XFER_TIMEOUT_MS);
 		 libusb_set_iso_packet_lengths(transfer, selected_packet_size);
- 
+		 /* Pre-build the kernel URBs once so every resubmit on the USB thread is
+		  * a bookkeeping reset plus SUBMITURB ioctls, with no calloc/free.  A
+		  * failure just leaves the allocating slow path in place. */
+		 {
+			 const int pre = libusb_prealloc_iso_urbs(transfer);
+			 if (UNLIKELY(pre != LIBUSB_SUCCESS))
+				 UVC_HOSTCAP_LOGI("libuvc iso transfer %d: URB prealloc failed (%d), using slow path",
+					 transfer_id, pre);
+		 }
 	 }
 
 	 return UVC_SUCCESS;

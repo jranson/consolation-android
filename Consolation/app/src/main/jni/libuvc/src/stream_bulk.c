@@ -8,6 +8,7 @@
 #include <android/log.h>
 #endif
 
+#include <libusb/libusb_prealloc.h>
 #include "libuvc/stream_log.h"
 #include "libuvc/libuvc.h"
 #include "libuvc/libuvc_internal.h"
@@ -156,7 +157,9 @@ uvc_error_t _uvc_stream_setup_bulk_transfers(uvc_stream_handle_t *strmh,
 			strmh->transfer_bufs[transfer_id],
 			strmh->cur_ctrl.dwMaxPayloadTransferSize, _uvc_stream_callback,
 			(void *)strmh, LIBUVC_STREAM_XFER_TIMEOUT_MS);
-
+		/* See stream_iso.c: build the URBs once, resubmit without allocating. */
+		if (UNLIKELY(libusb_prealloc_bulk_urbs(transfer) != LIBUSB_SUCCESS))
+			UVC_DEBUG("bulk transfer %d: URB prealloc failed, using slow path", transfer_id);
 	}
 	return UVC_SUCCESS;
 }
