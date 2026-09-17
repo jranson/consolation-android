@@ -130,6 +130,11 @@ private:
 		return frame && frame->yuv_hardware_buffers[0] != NULL;
 	}
 	bool decode_mjpeg_to_gpu_planar(uvc_frame_t *frame);
+	/** Render a decoded planar frame and return it to its pool.  Used by the
+	 * preview thread, or directly by the decode thread when merged rendering
+	 * is on (saves the ring hand-off; costs the decode/render overlap). */
+	void presentPlanarFrame(uvc_frame_t *frame);
+	volatile bool mMergedRender;
 	int previewFormat;
 	size_t previewBytes;
 //

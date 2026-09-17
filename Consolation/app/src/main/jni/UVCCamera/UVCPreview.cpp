@@ -343,6 +343,7 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 		mGpuPlanar[i].fence_fd = -1;
 	mGpuPlanarNext = 0;
 	mGpuPlanarRenderFailures = 0;
+	mMergedRender = true;
 	{
 		/* Pick a GPU-sampleable buffer format for the zero-copy planar path.
 		 * R8 is the natural fit but many gralloc implementations reject it;
@@ -597,7 +598,10 @@ bool UVCPreview::decode_mjpeg_to_gpu_planar(uvc_frame_t *frame)
 		out->yuv_hardware_buffers[i] = widths[i] ? g->ahb[i] : NULL;
 		out->yuv_hardware_buffer_ids[i] = widths[i] ? g->ids[i] : 0;
 	}
-	addPreviewFrame(out);
+	if (mMergedRender)
+		presentPlanarFrame(out);
+	else
+		addPreviewFrame(out);
 	return true;
 }
 
@@ -1626,6 +1630,18 @@ void *UVCPreview::mjpeg_decode_thread_func(void *vptr_args) {
 }
 
 void UVCPreview::do_mjpeg_decode() {
+	{
+		/* Merged decode+render is chosen once per stream: the EGL context can be
+		 * current on only one thread, so it cannot move between the decode and
+		 * preview threads while running.  A/B: setprop debug.consolation.merged_render 0
+		 * then restart the preview. */
+		char mv[PROP_VALUE_MAX] = {};
+		mMergedRender = true;
+		if (__system_property_get("debug.consolation.merged_render", mv) > 0 && mv[0] == '0')
+			mMergedRender = false;
+		LOGI("merged-render: %s (decode thread %s the planar frame)",
+			mMergedRender ? "on" : "off", mMergedRender ? "renders" : "hands off");
+	}
 	for (; LIKELY(isRunning() && mjpeg_decode_thread_joinable); ) {
 		uvc_frame_t *frame = waitMjpegDecodeFrame();
 		if (!frame)
@@ -1684,7 +1700,10 @@ void UVCPreview::do_mjpeg_decode() {
 				decoded->integrity_sample_hash =
 					uvc_frame_sample_hash(decoded->data, decoded->actual_bytes);
 #endif
-				addPreviewFrame(decoded);
+				if (mMergedRender)
+					presentPlanarFrame(decoded);
+				else
+					addPreviewFrame(decoded);
 				decoded = NULL;
 			} else {
 				/* Corrupt or undecodable frame: not shown, last good frame stays.
@@ -1981,6 +2000,58 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 	RETURN(result, int);
 }
 
+void UVCPreview::presentPlanarFrame(uvc_frame_t *frame) {
+	uint64_t frame_ready_ns = 0;
+	uint64_t surface_wait_ns = 0;
+	/* Stage 4: decode thread -> preview thread (pool frame). */
+	if (UNLIKELY(!frame_integrity_ok(frame, "decode->render", g_integrity_mismatch_render))) {
+		processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+		recycle_frame(frame);
+		return;
+	}
+	const uint64_t t_render = processing_now_ns();
+	const bool rendered = renderFrameDirectToSurface(frame,
+		&mPreviewWindow, &preview_mutex, &frame_ready_ns,
+		&surface_wait_ns);
+	{
+		/* Per-path render cost (upload+draw+swap), logged every
+		 * 600 frames so the zero-copy path can be A/B'd on device. */
+		static uint64_t s_sum[2], s_max[2];
+		static uint32_t s_n[2];
+		const int path = gpu_planar_is(frame) ? 1 : 0;
+		const uint64_t dt = processing_now_ns() - t_render;
+		s_sum[path] += dt;
+		if (dt > s_max[path]) s_max[path] = dt;
+		if (++s_n[path] == 600) {
+			LOGI("planar-render: path=%s avg_us=%llu max_us=%llu over 600 frames",
+				path ? "zero-copy" : "upload",
+				(unsigned long long)(s_sum[path] / 600 / 1000),
+				(unsigned long long)(s_max[path] / 1000));
+			s_sum[path] = 0; s_max[path] = 0; s_n[path] = 0;
+		}
+	}
+	if (rendered && frame_ready_ns && frame->arrival_monotonic_ns) {
+		recordEndToEndLatencyTiming(frame->arrival_monotonic_ns,
+			frame_ready_ns);
+	}
+	if (gpu_planar_is(frame)) {
+		if (rendered) {
+			mGpuPlanarRenderFailures = 0;
+			gpu_planar_put(frame, mGpuPreviewRenderer
+				? mGpuPreviewRenderer->takeRenderFenceFd() : -1);
+		} else {
+			gpu_planar_put(frame, -1);
+			if (++mGpuPlanarRenderFailures >= 3 && mGpuPlanarEnabled) {
+				LOGW("gpu-planar: render failed %u times; falling back to texture upload",
+					mGpuPlanarRenderFailures);
+				mGpuPlanarEnabled = false;
+			}
+		}
+	} else {
+		recycle_frame(frame);
+	}
+}
+
 void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 	ENTER();
 
@@ -2057,56 +2128,7 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 						continue;
 					}
 					if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG_YUV_PLANAR) {
-						uint64_t frame_ready_ns = 0;
-						uint64_t surface_wait_ns = 0;
-						/* Stage 4: decode thread -> preview thread (pool frame). */
-						if (UNLIKELY(!frame_integrity_ok(frame, "decode->render", g_integrity_mismatch_render))) {
-							processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
-							recycle_frame(frame);
-							frame = NULL;
-							continue;
-						}
-						const uint64_t t_render = processing_now_ns();
-						const bool rendered = renderFrameDirectToSurface(frame,
-							&mPreviewWindow, &preview_mutex, &frame_ready_ns,
-							&surface_wait_ns);
-						{
-							/* Per-path render cost (upload+draw+swap), logged every
-							 * 600 frames so the zero-copy path can be A/B'd on device. */
-							static uint64_t s_sum[2], s_max[2];
-							static uint32_t s_n[2];
-							const int path = gpu_planar_is(frame) ? 1 : 0;
-							const uint64_t dt = processing_now_ns() - t_render;
-							s_sum[path] += dt;
-							if (dt > s_max[path]) s_max[path] = dt;
-							if (++s_n[path] == 600) {
-								LOGI("planar-render: path=%s avg_us=%llu max_us=%llu over 600 frames",
-									path ? "zero-copy" : "upload",
-									(unsigned long long)(s_sum[path] / 600 / 1000),
-									(unsigned long long)(s_max[path] / 1000));
-								s_sum[path] = 0; s_max[path] = 0; s_n[path] = 0;
-							}
-						}
-						if (rendered && frame_ready_ns && frame->arrival_monotonic_ns) {
-							recordEndToEndLatencyTiming(frame->arrival_monotonic_ns,
-								frame_ready_ns);
-						}
-						if (gpu_planar_is(frame)) {
-							if (rendered) {
-								mGpuPlanarRenderFailures = 0;
-								gpu_planar_put(frame, mGpuPreviewRenderer
-									? mGpuPreviewRenderer->takeRenderFenceFd() : -1);
-							} else {
-								gpu_planar_put(frame, -1);
-								if (++mGpuPlanarRenderFailures >= 3 && mGpuPlanarEnabled) {
-									LOGW("gpu-planar: render failed %u times; falling back to texture upload",
-										mGpuPlanarRenderFailures);
-									mGpuPlanarEnabled = false;
-								}
-							}
-						} else {
-							recycle_frame(frame);
-						}
+						presentPlanarFrame(frame);
 						frame = NULL;
 						continue;
 					}

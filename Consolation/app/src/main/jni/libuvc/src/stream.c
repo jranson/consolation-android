@@ -47,6 +47,8 @@
 #ifdef __ANDROID__
 #include <android/log.h>
 #include <android/hardware_buffer.h>
+#include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 #include "libuvc/libuvc.h"
@@ -760,10 +762,12 @@ void _uvc_swap_buffers(uvc_stream_handle_t *strmh, const char *reason) {
 			strmh->outbuf = NULL;
 			strmh->bfh_err |= UVC_STREAM_ERR;
 		}
-
-		pthread_cond_broadcast(&strmh->cb_cond);
 	}
 	pthread_mutex_unlock(&strmh->cb_mutex);
+	/* Signal after unlock: bionic has no wait morphing, so a waiter woken
+	 * while the mutex is still held just blocks on it again (two context
+	 * switches instead of one). */
+	pthread_cond_broadcast(&strmh->cb_cond);
 
 	strmh->seq++;
 	strmh->got_bytes = 0;
@@ -1632,6 +1636,15 @@ static void *_uvc_user_caller(void *arg) {
 
 	uint32_t last_seq = 0;
 	int deliver;
+
+#if defined(__ANDROID__)
+	/* This thread only hands published frames to the consumer, but it sits
+	 * between the USB thread (nice -18) and the decoder (nice -4); at default
+	 * priority it was the one hop that UI work could preempt.  Keep it above
+	 * the decoder so a published frame is queued for decode without delay. */
+	pthread_setname_np(pthread_self(), "UVC-cb");
+	(void)setpriority(PRIO_PROCESS, (id_t)gettid(), -8);
+#endif
 
 	for (; 1 ;) {
 		pthread_mutex_lock(&strmh->cb_mutex);
