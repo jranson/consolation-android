@@ -30,6 +30,11 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          # The action's default is "tools platform-tools", but the obsolete "tools"
+          # package has been removed from Google's SDK repository and now fails with
+          # "Failed to find package 'tools'". Gradle/AGP fetch what else they need.
+          packages: platform-tools
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
