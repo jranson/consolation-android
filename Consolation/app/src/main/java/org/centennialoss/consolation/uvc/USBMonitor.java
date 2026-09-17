@@ -48,6 +48,8 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.util.SparseArray;
 
+import androidx.core.content.IntentCompat;
+
 import org.centennialoss.consolation.uvc.util.HandlerThreadHandler;
 
 public final class USBMonitor {
@@ -505,6 +507,14 @@ public final class USBMonitor {
 	}
 
 	/**
+	 * Reads the {@link UsbDevice} extra from a USB broadcast. IntentCompat keeps this working
+	 * below API 33, where the typed Intent#getParcelableExtra(String, Class) overload is absent.
+	 */
+	private static UsbDevice getUsbDeviceExtra(final Intent intent) {
+		return IntentCompat.getParcelableExtra(intent, UsbManager.EXTRA_DEVICE, UsbDevice.class);
+	}
+
+	/**
 	 * BroadcastReceiver for USB permission
 	 */
 	private final BroadcastReceiver mUsbReceiver = new BroadcastReceiver() {
@@ -516,7 +526,7 @@ public final class USBMonitor {
 			if (ACTION_USB_PERMISSION.equals(action)) {
 				// when received the result of requesting USB permission
 				synchronized (USBMonitor.this) {
-					final UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
+					final UsbDevice device = getUsbDeviceExtra(intent);
 					if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
 						if (device != null) {
 							// get permission, call onConnect
@@ -528,12 +538,12 @@ public final class USBMonitor {
 					}
 				}
 			} else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
-				final UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
+				final UsbDevice device = getUsbDeviceExtra(intent);
 				updatePermission(device, hasPermission(device));
 				processAttach(device);
 			} else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
 				// when device removed
-				final UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
+				final UsbDevice device = getUsbDeviceExtra(intent);
 				if (device != null) {
 					UsbControlBlock ctrlBlock = mCtrlBlocks.remove(device);
 					if (ctrlBlock != null) {

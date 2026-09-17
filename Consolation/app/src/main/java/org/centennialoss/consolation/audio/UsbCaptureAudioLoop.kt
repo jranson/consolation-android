@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
+import android.os.Build
 import android.os.SystemClock
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
@@ -109,7 +110,13 @@ class UsbCaptureAudioLoop(
 
         val inputCapture: AudioRecord? = try {
             AudioRecord.Builder()
-                .setContext(appContext)
+                .apply {
+                    // setContext() is API 31+. Below that AudioRecord uses the process context,
+                    // which is what appContext is anyway, so there is nothing to substitute.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        setContext(appContext)
+                    }
+                }
                 .setAudioSource(MediaRecorder.AudioSource.UNPROCESSED)
                 .setAudioFormat(
                     AudioFormat.Builder()

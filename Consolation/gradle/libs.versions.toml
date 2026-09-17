@@ -1,7 +1,7 @@
 [versions]
 # Single minSdk for :app (vendored UVCCamera JNI + Java now live under app/src/main).
-# Current product floor is API 34 (Android 14+); change here if you lower the app minimum.
-minSdk = "34"
+# Current product floor is API 28 (Android 9+); change here if you lower the app minimum.
+minSdk = "28"
 agp = "9.4.0"
 kotlin = "2.2.10"
 playPublisher = "4.0.0"

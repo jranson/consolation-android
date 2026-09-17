@@ -383,7 +383,12 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 			probe.layers = 1;
 			probe.format = cands[c].format;
 			probe.usage = cands[c].usage;
-			if (AHardwareBuffer_isSupported(&probe)) {
+			/* AHardwareBuffer_isSupported() is API 29+; actually allocating a
+			 * small buffer is the portable equivalent and answers the same
+			 * question more honestly. This runs once at preview setup. */
+			AHardwareBuffer *probe_buf = NULL;
+			if (AHardwareBuffer_allocate(&probe, &probe_buf) == 0 && probe_buf) {
+				AHardwareBuffer_release(probe_buf);
 				mGpuPlanarEnabled = true;
 				mGpuPlanarFormat = cands[c].format;
 				mGpuPlanarUsage = cands[c].usage;
