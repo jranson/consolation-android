@@ -123,9 +123,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import java.util.Locale
-import kotlin.math.cos
 import kotlin.math.roundToInt
-import kotlin.math.sin
 
 private val ConsolationColorScheme = darkColorScheme(
     primary = Color(0xFFCC11BB),
@@ -188,8 +186,12 @@ class MainActivity : ComponentActivity() {
     private var previewStreamHeight by mutableIntStateOf(0)
     private var zoomPanOffsetX by mutableFloatStateOf(0f)
     private var zoomPanOffsetY by mutableFloatStateOf(0f)
-    private var previewLayoutWidthPx by mutableFloatStateOf(0f)
-    private var previewLayoutHeightPx by mutableFloatStateOf(0f)
+    /** Size of the full-screen preview area (the SurfaceView fills all of it). */
+    private var previewContainerWidthPx by mutableFloatStateOf(0f)
+    private var previewContainerHeightPx by mutableFloatStateOf(0f)
+    /** Fit-to-screen content box inside the preview area, at the stream's (rotated) aspect. */
+    private val previewLayoutWidthPx: Float get() = fittedPreviewBoxSize().first
+    private val previewLayoutHeightPx: Float get() = fittedPreviewBoxSize().second
 
     private var audioVolumePercent by mutableIntStateOf(100)
     private var audioMuted by mutableStateOf(false)
@@ -1251,52 +1253,69 @@ class MainActivity : ComponentActivity() {
         if (previewStreamWidth <= 0 || previewStreamHeight <= 0 || w <= 0f || h <= 0f) return null
         /* The SurfaceView box takes the rotated aspect (the renderer rotates the content), so
          * the stream's width then runs along the box height. The TextureView box is unrotated. */
-        val useSurfaceView = selectedPixelFormatPreference != PixelFormatPreference.H264
-        val boxSpanForStreamWidth = if (useSurfaceView && currentRotation % 180 == 90) h else w
+        val boxSpanForStreamWidth = if (usesSurfaceViewPreview() && currentRotation % 180 == 90) h else w
         return previewStreamWidth / boxSpanForStreamWidth
+    }
+
+    /** Every format but H264 renders through the native GPU renderer into a SurfaceView. */
+    private fun usesSurfaceViewPreview(): Boolean =
+        selectedPixelFormatPreference != PixelFormatPreference.H264
+
+    /**
+     * Aspect of the fit-to-screen content box. With a SurfaceView the renderer rotates the
+     * content, so the box takes the rotated aspect; the TextureView path rotates the whole view.
+     */
+    private fun previewBoxAspect(): Float {
+        return if (usesSurfaceViewPreview() && currentRotation % 180 == 90) {
+            1f / previewAspectRatio
+        } else {
+            previewAspectRatio
+        }
+    }
+
+    private fun fittedPreviewBoxSize(): Pair<Float, Float> {
+        val cw = previewContainerWidthPx
+        val ch = previewContainerHeightPx
+        val aspect = previewBoxAspect()
+        if (cw <= 0f || ch <= 0f || aspect <= 0f) return 0f to 0f
+        return if (cw / ch > aspect) (ch * aspect) to ch else cw to (cw / aspect)
     }
 
     private fun isPreviewZoomedIn(scale: Float): Boolean = scale > 1.0f + ZOOM_PAN_EPSILON
 
-    private fun effectivePreviewDimensionsForPan(widthPx: Float, heightPx: Float): Pair<Float, Float> {
-        return if (currentRotation % 180 == 90) {
-            heightPx to widthPx
-        } else {
-            widthPx to heightPx
-        }
+    /**
+     * On-screen size of the zoomed content. The TextureView is laid out unrotated and then
+     * rotated as a whole, so at 90/270 its box spans swap on screen.
+     */
+    private fun displayedPreviewSize(scale: Float): Pair<Float, Float> {
+        val w = previewLayoutWidthPx * scale
+        val h = previewLayoutHeightPx * scale
+        return if (!usesSurfaceViewPreview() && currentRotation % 180 == 90) h to w else w to h
     }
 
-    private fun maxZoomPanOffsetX(widthPx: Float, heightPx: Float, scale: Float): Float {
-        val (effectiveWidth, _) = effectivePreviewDimensionsForPan(widthPx, heightPx)
-        return (effectiveWidth * (scale - 1f) / 2f).coerceAtLeast(0f)
+    /*
+     * Pan offsets are screen pixels (the pan is applied after rotation and mirroring), limited
+     * so the zoomed content keeps covering the screen along any axis where it is larger than
+     * the screen; a letterboxed axis stays centered until the zoom fills it.
+     */
+    private fun maxZoomPanOffsetX(scale: Float): Float {
+        return ((displayedPreviewSize(scale).first - previewContainerWidthPx) / 2f).coerceAtLeast(0f)
     }
 
-    private fun maxZoomPanOffsetY(widthPx: Float, heightPx: Float, scale: Float): Float {
-        val (_, effectiveHeight) = effectivePreviewDimensionsForPan(widthPx, heightPx)
-        return (effectiveHeight * (scale - 1f) / 2f).coerceAtLeast(0f)
+    private fun maxZoomPanOffsetY(scale: Float): Float {
+        return ((displayedPreviewSize(scale).second - previewContainerHeightPx) / 2f).coerceAtLeast(0f)
     }
 
-    private fun clampZoomPanOffsets(widthPx: Float, heightPx: Float, scale: Float) {
-        if (!isPreviewZoomedIn(scale) || widthPx <= 0f || heightPx <= 0f) {
+    private fun clampZoomPanOffsets(scale: Float) {
+        if (!isPreviewZoomedIn(scale) || previewLayoutWidthPx <= 0f || previewLayoutHeightPx <= 0f) {
             zoomPanOffsetX = 0f
             zoomPanOffsetY = 0f
             return
         }
-        val maxX = maxZoomPanOffsetX(widthPx, heightPx, scale)
-        val maxY = maxZoomPanOffsetY(widthPx, heightPx, scale)
+        val maxX = maxZoomPanOffsetX(scale)
+        val maxY = maxZoomPanOffsetY(scale)
         zoomPanOffsetX = zoomPanOffsetX.coerceIn(-maxX, maxX)
         zoomPanOffsetY = zoomPanOffsetY.coerceIn(-maxY, maxY)
-    }
-
-    private fun transformDragToPanDelta(dragX: Float, dragY: Float): Pair<Float, Float> {
-        var x = dragX
-        var y = dragY
-        if (isFlippedHorizontal) x = -x
-        if (isFlippedVertical) y = -y
-        val radians = Math.toRadians(-currentRotation.toDouble())
-        val c = cos(radians).toFloat()
-        val s = sin(radians).toFloat()
-        return (x * c - y * s) to (x * s + y * c)
     }
 
     private fun showSettingsDialog() {
@@ -1639,10 +1658,11 @@ class MainActivity : ComponentActivity() {
             currentRotation,
             isFlippedHorizontal,
             isFlippedVertical,
-            previewLayoutWidthPx,
-            previewLayoutHeightPx,
+            previewContainerWidthPx,
+            previewContainerHeightPx,
+            previewAspectRatio,
         ) {
-            clampZoomPanOffsets(previewLayoutWidthPx, previewLayoutHeightPx, baseScale)
+            clampZoomPanOffsets(baseScale)
         }
         Box(
             modifier = Modifier
@@ -1657,31 +1677,38 @@ class MainActivity : ComponentActivity() {
                     }
                 },
         ) {
-            val useSurfaceView = selectedPixelFormatPreference != PixelFormatPreference.H264
-            /* With a SurfaceView the renderer rotates the content, so the box itself must
-             * take the rotated aspect; the TextureView path rotates the whole view instead. */
-            val boxAspect = if (useSurfaceView && currentRotation % 180 == 90) {
-                1f / previewAspectRatio
-            } else {
-                previewAspectRatio
-            }
+            val useSurfaceView = usesSurfaceViewPreview()
+            val boxAspect = previewBoxAspect()
             if (useSurfaceView) {
+                /* The SurfaceView fills the screen so zooming can grow into the letterbox; the
+                 * renderer fits the content box into it, then pans in surface NDC. */
                 LaunchedEffect(
                     currentRotation, isFlippedHorizontal, isFlippedVertical, baseScale,
                     zoomPanOffsetX, zoomPanOffsetY,
-                    previewLayoutWidthPx, previewLayoutHeightPx,
+                    previewContainerWidthPx, previewContainerHeightPx, boxAspect,
                 ) {
-                    val w = previewLayoutWidthPx
-                    val h = previewLayoutHeightPx
+                    val cw = previewContainerWidthPx
+                    val ch = previewContainerHeightPx
                     val zoomedIn = isPreviewZoomedIn(baseScale)
-                    val panX = if (zoomedIn && w > 0f) 2f * zoomPanOffsetX / w else 0f
-                    val panY = if (zoomedIn && h > 0f) -2f * zoomPanOffsetY / h else 0f
+                    val panX = if (zoomedIn && cw > 0f) 2f * zoomPanOffsetX / cw else 0f
+                    val panY = if (zoomedIn && ch > 0f) -2f * zoomPanOffsetY / ch else 0f
+                    val fitX = if (cw > 0f) (previewLayoutWidthPx / cw).coerceIn(0f, 1f) else 1f
+                    val fitY = if (ch > 0f) (previewLayoutHeightPx / ch).coerceIn(0f, 1f) else 1f
                     previewBackend.setPreviewTransform(
                         currentRotation, isFlippedHorizontal, isFlippedVertical, baseScale, panX, panY,
+                        fitX, fitY,
                     )
                 }
             }
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .onSizeChanged {
+                        previewContainerWidthPx = it.width.toFloat()
+                        previewContainerHeightPx = it.height.toFloat()
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
                 key(previewTextureGeneration, useSurfaceView) {
                     AndroidView(
                         factory = { context ->
@@ -1692,17 +1719,13 @@ class MainActivity : ComponentActivity() {
                             }
                         },
                         modifier = Modifier
-                            .fillMaxHeight()
-                            .aspectRatio(boxAspect)
-                            .onSizeChanged {
-                                previewLayoutWidthPx = it.width.toFloat()
-                                previewLayoutHeightPx = it.height.toFloat()
-                                clampZoomPanOffsets(
-                                    previewLayoutWidthPx,
-                                    previewLayoutHeightPx,
-                                    baseScale,
-                                )
-                            }
+                            .then(
+                                if (useSurfaceView) {
+                                    Modifier.fillMaxSize()
+                                } else {
+                                    Modifier.fillMaxHeight().aspectRatio(boxAspect)
+                                },
+                            )
                             .pointerInput(
                                 currentRotation,
                                 isFlippedHorizontal,
@@ -1712,19 +1735,11 @@ class MainActivity : ComponentActivity() {
                                 if (!isPreviewZoomedIn(baseScale)) return@pointerInput
                                 detectDragGestures { change, dragAmount ->
                                     change.consume()
-                                    val (dx, dy) = transformDragToPanDelta(dragAmount.x, dragAmount.y)
-                                    val maxX = maxZoomPanOffsetX(
-                                        previewLayoutWidthPx,
-                                        previewLayoutHeightPx,
-                                        baseScale,
-                                    )
-                                    val maxY = maxZoomPanOffsetY(
-                                        previewLayoutWidthPx,
-                                        previewLayoutHeightPx,
-                                        baseScale,
-                                    )
-                                    zoomPanOffsetX = (zoomPanOffsetX + dx).coerceIn(-maxX, maxX)
-                                    zoomPanOffsetY = (zoomPanOffsetY + dy).coerceIn(-maxY, maxY)
+                                    // Offsets are screen pixels, so the content simply follows the finger.
+                                    val maxX = maxZoomPanOffsetX(baseScale)
+                                    val maxY = maxZoomPanOffsetY(baseScale)
+                                    zoomPanOffsetX = (zoomPanOffsetX + dragAmount.x).coerceIn(-maxX, maxX)
+                                    zoomPanOffsetY = (zoomPanOffsetY + dragAmount.y).coerceIn(-maxY, maxY)
                                     resetControlsTimer()
                                 }
                             }
@@ -2170,11 +2185,7 @@ class MainActivity : ComponentActivity() {
                     } else {
                         position
                     }
-                    clampZoomPanOffsets(
-                        previewLayoutWidthPx,
-                        previewLayoutHeightPx,
-                        previewZoomScale(),
-                    )
+                    clampZoomPanOffsets(previewZoomScale())
                     resetControlsTimer()
                 },
                 onValueChangeFinished = {
@@ -2215,11 +2226,7 @@ class MainActivity : ComponentActivity() {
                     onClickLabel = getString(R.string.action_toggle_zoom_one_to_one),
                 ) {
                     applyOneToOneZoom(!isOneToOneZoom)
-                    clampZoomPanOffsets(
-                        previewLayoutWidthPx,
-                        previewLayoutHeightPx,
-                        previewZoomScale(),
-                    )
+                    clampZoomPanOffsets(previewZoomScale())
                     persistSettings()
                     resetControlsTimer()
                 },

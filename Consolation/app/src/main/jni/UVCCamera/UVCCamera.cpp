@@ -291,11 +291,11 @@ int UVCCamera::setPreviewDisplay(ANativeWindow *preview_window) {
 }
 
 int UVCCamera::setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_v,
-	float scale, float pan_x_ndc, float pan_y_ndc) {
+	float scale, float pan_x_ndc, float pan_y_ndc, float fit_x, float fit_y) {
 	int result = EXIT_FAILURE;
 	if (mPreview)
 		result = mPreview->setPreviewTransform(rotation_degrees, flip_h, flip_v,
-			scale, pan_x_ndc, pan_y_ndc);
+			scale, pan_x_ndc, pan_y_ndc, fit_x, fit_y);
 	return result;
 }
 

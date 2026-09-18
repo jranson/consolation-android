@@ -338,6 +338,11 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 		static const float identity[9] = { 1, 0, 0,  0, 1, 0,  0, 0, 1 };
 		memcpy(mPreviewXform, identity, sizeof(mPreviewXform));
 	}
+	mPreviewFitX = 1.0f;
+	mPreviewFitY = 1.0f;
+	mPreviewGeomWidth = 0;
+	mPreviewGeomHeight = 0;
+	mPreviewSurfaceSizeDirty = false;
 	memset(mGpuPlanar, 0, sizeof(mGpuPlanar));
 	for (int i = 0; i < GPU_PLANAR_POOL_SZ; i++)
 		mGpuPlanar[i].fence_fd = -1;
@@ -1078,6 +1083,8 @@ int UVCPreview::setPreviewDisplay(ANativeWindow *preview_window) {
 			if (LIKELY(mPreviewWindow)) {
 				ANativeWindow_setBuffersGeometry(mPreviewWindow,
 					frameWidth, frameHeight, previewFormat);
+				mPreviewGeomWidth = frameWidth;
+				mPreviewGeomHeight = frameHeight;
 			}
 		} else if (preview_window) {
 			/* JNI calls ANativeWindow_fromSurface each time; if the pointer matches the
@@ -1090,22 +1097,32 @@ int UVCPreview::setPreviewDisplay(ANativeWindow *preview_window) {
 }
 
 int UVCPreview::setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_v,
-	float scale, float pan_x_ndc, float pan_y_ndc) {
-	/* Mirrors Compose graphicsLayer order: scale (incl. mirror) -> rotate ->
-	 * translate.  NDC has y up while the screen has y down, so a clockwise
-	 * on-screen rotation by r is (x, y) -> (x cos r + y sin r, -x sin r + y cos r). */
+	float scale, float pan_x_ndc, float pan_y_ndc, float fit_x, float fit_y) {
+	/* scale (incl. mirror) -> rotate -> fit -> translate.  Rotation happens in the
+	 * NDC of the fit-to-screen content box (which has the rotated aspect), the fit
+	 * step maps that box into the full surface, and the pan is in surface NDC.
+	 * NDC has y up while the screen has y down, so a clockwise on-screen rotation
+	 * by r is (x, y) -> (x cos r + y sin r, -x sin r + y cos r). */
+	if (!(fit_x > 0.0f) || fit_x > 1.0f)
+		fit_x = 1.0f;
+	if (!(fit_y > 0.0f) || fit_y > 1.0f)
+		fit_y = 1.0f;
 	const double r = rotation_degrees * M_PI / 180.0;
 	const float c = (float)cos(r);
 	const float sn = (float)sin(r);
 	const float sx = scale * (flip_h ? -1.0f : 1.0f);
 	const float sy = scale * (flip_v ? -1.0f : 1.0f);
-	/* M = T * R * S, column-major for glUniformMatrix3fv. */
+	/* M = T * F * R * S, column-major for glUniformMatrix3fv (F scales rows). */
 	float m[9];
-	m[0] = c * sx;   m[1] = -sn * sx;  m[2] = 0.0f;	/* column 0 */
-	m[3] = sn * sy;  m[4] = c * sy;    m[5] = 0.0f;	/* column 1 */
-	m[6] = pan_x_ndc; m[7] = pan_y_ndc; m[8] = 1.0f;	/* column 2 */
+	m[0] = fit_x * c * sx;   m[1] = -fit_y * sn * sx;  m[2] = 0.0f;	/* column 0 */
+	m[3] = fit_x * sn * sy;  m[4] = fit_y * c * sy;    m[5] = 0.0f;	/* column 1 */
+	m[6] = pan_x_ndc;        m[7] = pan_y_ndc;         m[8] = 1.0f;	/* column 2 */
 	pthread_mutex_lock(&preview_mutex);
 	memcpy(mPreviewXform, m, sizeof(mPreviewXform));
+	mPreviewFitX = fit_x;
+	mPreviewFitY = fit_y;
+	/* Kotlin re-sends the transform whenever the view's size changes. */
+	mPreviewSurfaceSizeDirty = true;
 	pthread_mutex_unlock(&preview_mutex);
 	return 0;
 }
@@ -1729,6 +1746,29 @@ void UVCPreview::do_mjpeg_decode() {
 	}
 }
 
+/* Blacks out the buffer area around a frame decoded at (off_x, off_y); RGBX 0 is black.
+ * Only the letterbox strips are touched, never the frame itself. */
+static void clearLetterbox(uint8_t *bits, size_t row_bytes, int32_t buf_w, int32_t buf_h,
+	uint32_t frame_w, uint32_t frame_h, size_t off_x, size_t off_y) {
+	const size_t px = PREVIEW_PIXEL_BYTES;
+	const size_t right_x = off_x + frame_w;
+	const size_t right_bytes = ((size_t) buf_w - right_x) * px;
+	if (off_y)
+		memset(bits, 0, off_y * row_bytes);
+	const size_t bottom_y = off_y + frame_h;
+	if ((size_t) buf_h > bottom_y)
+		memset(bits + bottom_y * row_bytes, 0, ((size_t) buf_h - bottom_y) * row_bytes);
+	if (off_x || right_bytes) {
+		for (size_t y = off_y; y < bottom_y; ++y) {
+			uint8_t *row = bits + y * row_bytes;
+			if (off_x)
+				memset(row, 0, off_x * px);
+			if (right_bytes)
+				memset(row + right_x * px, 0, right_bytes);
+		}
+	}
+}
+
 bool UVCPreview::renderFrameDirectToSurface(uvc_frame_t *frame,
 	ANativeWindow **window, pthread_mutex_t *window_mutex,
 	uint64_t *frame_ready_ns, uint64_t *surface_wait_ns) {
@@ -1738,6 +1778,18 @@ bool UVCPreview::renderFrameDirectToSurface(uvc_frame_t *frame,
 	ANativeWindow *target = *window;
 	if (LIKELY(target)) {
 		if (mGpuPreviewRenderer) {
+			/* The GPU path renders at the view's own size (1:1 with the screen);
+			 * only the CPU fallback below needs stream-sized buffers. */
+			if (mPreviewGeomWidth || mPreviewGeomHeight) {
+				ANativeWindow_setBuffersGeometry(target, 0, 0, previewFormat);
+				mPreviewGeomWidth = 0;
+				mPreviewGeomHeight = 0;
+				mPreviewSurfaceSizeDirty = true;
+			}
+			if (mPreviewSurfaceSizeDirty) {
+				mGpuPreviewRenderer->invalidateSurfaceSize();
+				mPreviewSurfaceSizeDirty = false;
+			}
 			mGpuPreviewRenderer->setTransform(mPreviewXform);
 			if (frame->frame_format != UVC_FRAME_FORMAT_MJPEG
 					&& mGpuPreviewRenderer->render(frame, target, frame_ready_ns)) {
@@ -1776,6 +1828,21 @@ bool UVCPreview::renderFrameDirectToSurface(uvc_frame_t *frame,
 				}
 			}
 		}
+		/* The view fills the screen, so pad the buffer to the screen's shape (the
+		 * compositor then scales it uniformly) and decode the frame into its center. */
+		{
+			int32_t geom_w = (int32_t) frame->width;
+			int32_t geom_h = (int32_t) frame->height;
+			if (mPreviewFitX < 1.0f)
+				geom_w = std::max(geom_w, (int32_t) lroundf(frame->width / mPreviewFitX) & ~1);
+			if (mPreviewFitY < 1.0f)
+				geom_h = std::max(geom_h, (int32_t) lroundf(frame->height / mPreviewFitY) & ~1);
+			if (geom_w != mPreviewGeomWidth || geom_h != mPreviewGeomHeight) {
+				ANativeWindow_setBuffersGeometry(target, geom_w, geom_h, previewFormat);
+				mPreviewGeomWidth = geom_w;
+				mPreviewGeomHeight = geom_h;
+			}
+		}
 		ANativeWindow_Buffer buffer;
 		const uint64_t lock_start_ns = processing_now_ns();
 		if (LIKELY(ANativeWindow_lock(target, &buffer, NULL) == 0)) {
@@ -1783,10 +1850,17 @@ bool UVCPreview::renderFrameDirectToSurface(uvc_frame_t *frame,
 				*surface_wait_ns += processing_now_ns() - lock_start_ns;
 			if (LIKELY(buffer.bits && buffer.width >= (int32_t) frame->width &&
 					buffer.height >= (int32_t) frame->height)) {
+				const size_t row_bytes = (size_t) buffer.stride * PREVIEW_PIXEL_BYTES;
+				const size_t off_x = (size_t) (buffer.width - (int32_t) frame->width) / 2;
+				const size_t off_y = (size_t) (buffer.height - (int32_t) frame->height) / 2;
+				uint8_t *bits = (uint8_t *) buffer.bits;
+				if (off_x || off_y)
+					clearLetterbox(bits, row_bytes, buffer.width, buffer.height,
+						frame->width, frame->height, off_x, off_y);
 				uvc_frame_t surface = {};
-				surface.data = buffer.bits;
-				surface.data_bytes = (size_t) buffer.stride * (size_t) buffer.height
-					* PREVIEW_PIXEL_BYTES;
+				surface.data = bits + off_y * row_bytes + off_x * PREVIEW_PIXEL_BYTES;
+				surface.data_bytes = row_bytes * ((size_t) buffer.height - off_y)
+					- off_x * PREVIEW_PIXEL_BYTES;
 				surface.width = frame->width;
 				surface.height = frame->height;
 				surface.frame_format = UVC_FRAME_FORMAT_RGBX;
@@ -1803,7 +1877,7 @@ bool UVCPreview::renderFrameDirectToSurface(uvc_frame_t *frame,
 				rendered = result == UVC_SUCCESS;
 				if (LIKELY(rendered && frame->frame_format == UVC_FRAME_FORMAT_MJPEG)) {
 					recordMjpegDecodedVisualSample(frame->sequence, frame->actual_bytes,
-						(const uint8_t *)buffer.bits, surface.step, frame->width, frame->height);
+						(const uint8_t *)surface.data, surface.step, frame->width, frame->height);
 				}
 				if (UNLIKELY(result && frame->frame_format == UVC_FRAME_FORMAT_MJPEG)) {
 					UVC_DIAG_LOGI("mjpeg-diag:decode-fail direct seq=%u bytes=%zu result=%d surface=%dx%d stride=%d frame=%ux%u",
@@ -1977,6 +2051,8 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 			if (LIKELY(mPreviewWindow)) {
 				ANativeWindow_setBuffersGeometry(mPreviewWindow,
 					frameWidth, frameHeight, previewFormat);
+				mPreviewGeomWidth = frameWidth;
+				mPreviewGeomHeight = frameHeight;
 			}
 			pthread_mutex_unlock(&preview_mutex);
 		} else {

@@ -148,6 +148,16 @@ private:
 	uvc_frame_t *captureQueu;			// keep latest frame
 	UVCGpuPreviewRenderer *mGpuPreviewRenderer;
 	float mPreviewXform[9];		/**< guarded by preview_mutex */
+	/** Fit-to-screen content box as a fraction of the preview surface (<= 1 per axis);
+	 * the CPU fallback pads its buffers to this shape.  Guarded by preview_mutex. */
+	float mPreviewFitX;
+	float mPreviewFitY;
+	/** Buffer geometry last applied to mPreviewWindow; 0x0 = the window's own size
+	 * (GPU path).  Guarded by preview_mutex. */
+	int32_t mPreviewGeomWidth;
+	int32_t mPreviewGeomHeight;
+	/** Set when the view may have resized, so the GPU renderer re-reads its surface size. */
+	bool mPreviewSurfaceSizeDirty;
 	uvc_frame_t *mMjpegPreviewYuvFrame;
 	jobject mFrameCallbackObj;
 	convFunc_t mFrameCallbackFunc;
@@ -264,11 +274,13 @@ public:
 	inline const bool isRunning() const;
 	int setPreviewSize(int width, int height, int min_fps, int max_fps, int mode, float bandwidth = 1.0f);
 	int setPreviewDisplay(ANativeWindow *preview_window);
-	/** Rotation (0/90/180/270, clockwise on screen), mirror flags, zoom scale
-	 * and pan in NDC units, applied by the GPU renderer.  Lets the preview live
-	 * in a SurfaceView, which cannot be rotated or mirrored by the View system. */
+	/** Rotation (0/90/180/270, clockwise on screen), mirror flags, zoom scale,
+	 * pan in surface NDC units, and the fit-to-screen content box as a fraction
+	 * of the surface (fit_x, fit_y <= 1), applied by the GPU renderer.  Lets the
+	 * preview live in a full-screen SurfaceView, which cannot be rotated or
+	 * mirrored by the View system, while zooming into the letterbox area. */
 	int setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_v,
-		float scale, float pan_x_ndc, float pan_y_ndc);
+		float scale, float pan_x_ndc, float pan_y_ndc, float fit_x, float fit_y);
 	int setPreviewFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int startPreview();

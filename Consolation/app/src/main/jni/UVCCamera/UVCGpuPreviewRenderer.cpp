@@ -522,6 +522,12 @@ void UVCGpuPreviewRenderer::setTransform(const float m[9])
 		memcpy(impl->xform, m, sizeof(impl->xform));
 }
 
+void UVCGpuPreviewRenderer::invalidateSurfaceSize()
+{
+	if (impl)
+		impl->frames_since_size_query = SURFACE_SIZE_REFRESH_FRAMES;
+}
+
 void UVCGpuPreviewRenderer::resetSurface()
 {
 	if (impl)

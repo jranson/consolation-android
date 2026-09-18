@@ -301,11 +301,11 @@ static jint nativeSetPreviewDisplay(JNIEnv *env, jobject thiz,
 
 static jint nativeSetPreviewTransform(JNIEnv *env, jobject thiz,
 	ID_TYPE id_camera, jint rotation, jboolean flip_h, jboolean flip_v,
-	jfloat scale, jfloat pan_x, jfloat pan_y) {
+	jfloat scale, jfloat pan_x, jfloat pan_y, jfloat fit_x, jfloat fit_y) {
 	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
 	if (LIKELY(camera))
 		return camera->setPreviewTransform(rotation, flip_h == JNI_TRUE, flip_v == JNI_TRUE,
-			scale, pan_x, pan_y);
+			scale, pan_x, pan_y, fit_x, fit_y);
 	return JNI_ERR;
 }
 
@@ -2108,7 +2108,7 @@ static JNINativeMethod methods[] = {
 	{ "nativeStartPreview",				"(J)I", (void *) nativeStartPreview },
 	{ "nativeStopPreview",				"(J)I", (void *) nativeStopPreview },
 	{ "nativeSetPreviewDisplay",		"(JLandroid/view/Surface;)I", (void *) nativeSetPreviewDisplay },
-	{ "nativeSetPreviewTransform",		"(JIZZFFF)I", (void *) nativeSetPreviewTransform },
+	{ "nativeSetPreviewTransform",		"(JIZZFFFFF)I", (void *) nativeSetPreviewTransform },
 	{ "nativeSetPreviewFrameCallback",	"(JLorg/centennialoss/consolation/uvc/IFrameCallback;I)I", (void *) nativeSetPreviewFrameCallback },
 	{ "nativeSetFrameCallback",			"(JLorg/centennialoss/consolation/uvc/IFrameCallback;I)I", (void *) nativeSetFrameCallback },
 

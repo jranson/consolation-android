@@ -59,6 +59,8 @@ class UvccameraLibPreviewBackend(
     private var xformScale = 1f
     private var xformPanX = 0f
     private var xformPanY = 0f
+    private var xformFitX = 1f
+    private var xformFitY = 1f
 
     private var usbMonitorRef: USBMonitor? = null
 
@@ -370,6 +372,8 @@ class UvccameraLibPreviewBackend(
         scale: Float,
         panXNdc: Float,
         panYNdc: Float,
+        fitScaleX: Float,
+        fitScaleY: Float,
     ) {
         xformRotation = rotationDegrees
         xformFlipH = flipHorizontal
@@ -377,7 +381,11 @@ class UvccameraLibPreviewBackend(
         xformScale = scale
         xformPanX = panXNdc
         xformPanY = panYNdc
-        uvcCamera?.setPreviewTransform(rotationDegrees, flipHorizontal, flipVertical, scale, panXNdc, panYNdc)
+        xformFitX = fitScaleX
+        xformFitY = fitScaleY
+        uvcCamera?.setPreviewTransform(
+            rotationDegrees, flipHorizontal, flipVertical, scale, panXNdc, panYNdc, fitScaleX, fitScaleY,
+        )
     }
 
     /** The target currently bound to a view, or null. */
@@ -1036,7 +1044,10 @@ class UvccameraLibPreviewBackend(
                         camera.setPreviewDisplay(target.holder.surface)
                         Log.i(logTag, "playback: setPreviewDisplay ${SystemClock.elapsedRealtime() - t1}ms")
                     }
-                    camera.setPreviewTransform(xformRotation, xformFlipH, xformFlipV, xformScale, xformPanX, xformPanY)
+                    camera.setPreviewTransform(
+                        xformRotation, xformFlipH, xformFlipV, xformScale, xformPanX, xformPanY,
+                        xformFitX, xformFitY,
+                    )
                 }
             }
 

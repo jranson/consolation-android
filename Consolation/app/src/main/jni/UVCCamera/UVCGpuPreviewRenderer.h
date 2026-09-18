@@ -18,6 +18,8 @@ public:
 	/** 3x3 column-major NDC transform applied to the quad (rotation, flip,
 	 * zoom, pan).  Called under the same lock as render(). */
 	void setTransform(const float m[9]);
+	/** Re-read the surface size on the next draw (the window may have resized). */
+	void invalidateSurfaceSize();
 	void resetSurface();
 	void shutdown();
 
