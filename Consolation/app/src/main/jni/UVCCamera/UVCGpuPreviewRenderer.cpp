@@ -797,6 +797,10 @@ void UVCGpuPreviewRenderer::Impl::drawQuad(ProgramKind kind)
 {
 	refreshSurfaceSize(false);
 	glViewport(0, 0, surface_width, surface_height);
+	/* A zoom scale below 1 (zoomed out / 1:1 on a small stream) leaves part of the
+	 * surface uncovered by the quad; clear it so the borders are black. */
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
 	glUniformMatrix3fv(uniforms[kind].xform, 1, GL_FALSE, xform);
 	glBindVertexArray(vao);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);

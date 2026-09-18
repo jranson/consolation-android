@@ -157,6 +157,7 @@ class MainActivity : ComponentActivity() {
     private var permissionTimeoutJob: Job? = null
     private var telemetryJob: Job? = null
     private var controlsAutoHideJob: Job? = null
+    private var oneToOneNoticeJob: Job? = null
     private var connectingWatchdogJob: Job? = null
     private var hasRetriedConnectingSession = false
     private var lastUsbPermissionGrantedAtMs = 0L
@@ -178,7 +179,13 @@ class MainActivity : ComponentActivity() {
     private var currentRotation by mutableIntStateOf(0)
     private var isFlippedHorizontal by mutableStateOf(false)
     private var isFlippedVertical by mutableStateOf(false)
-    private var currentZoom by mutableIntStateOf(0)
+    /** Zoom slider position 0..100; [ZOOM_FIT_POSITION] is fit-to-screen, below shrinks, above zooms in. */
+    private var currentZoom by mutableIntStateOf(ZOOM_FIT_POSITION)
+    /** When on, the preview is scaled so one stream pixel maps to one screen pixel (overrides the slider). */
+    private var isOneToOneZoom by mutableStateOf(false)
+    private var isOneToOneNoticeVisible by mutableStateOf(false)
+    private var previewStreamWidth by mutableIntStateOf(0)
+    private var previewStreamHeight by mutableIntStateOf(0)
     private var zoomPanOffsetX by mutableFloatStateOf(0f)
     private var zoomPanOffsetY by mutableFloatStateOf(0f)
     private var previewLayoutWidthPx by mutableFloatStateOf(0f)
@@ -1024,6 +1031,8 @@ class MainActivity : ComponentActivity() {
     private fun updateAspectRatio(width: Int, height: Int) {
         if (width > 0 && height > 0) {
             previewAspectRatio = width.toFloat() / height.toFloat()
+            previewStreamWidth = width
+            previewStreamHeight = height
         }
     }
 
@@ -1184,13 +1193,70 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Turns 1:1 pixel scaling on or off. Turning it on (re)shows the explanatory notice
+     * for [ONE_TO_ONE_NOTICE_MS], restarting the timer; turning it off hides the notice.
+     */
+    private fun applyOneToOneZoom(enabled: Boolean) {
+        isOneToOneZoom = enabled
+        oneToOneNoticeJob?.cancel()
+        oneToOneNoticeJob = null
+        isOneToOneNoticeVisible = enabled
+        if (enabled) {
+            oneToOneNoticeJob = lifecycleScope.launch {
+                delay(ONE_TO_ONE_NOTICE_MS)
+                isOneToOneNoticeVisible = false
+            }
+        }
+    }
+
     private fun updatePreviewScale() {
         // Compose applies scale/rotation from state.
     }
 
+    /** Scale the preview is drawn at: the 1:1 pixel scale when enabled, else the slider scale. */
     private fun previewZoomScale(): Float {
-        return 1.0f + (currentZoom / 100.0f) * (PREVIEW_MAX_ZOOM_SCALE - 1.0f)
+        if (isOneToOneZoom) {
+            oneToOneZoomScale()?.let { return it }
+        }
+        return zoomPositionToScale(currentZoom)
     }
+
+    private fun zoomPositionToScale(position: Int): Float {
+        val p = position.coerceIn(0, 100)
+        return if (p >= ZOOM_FIT_POSITION) {
+            val t = (p - ZOOM_FIT_POSITION) / (100f - ZOOM_FIT_POSITION)
+            1.0f + t * (PREVIEW_MAX_ZOOM_SCALE - 1.0f)
+        } else {
+            val t = p / ZOOM_FIT_POSITION.toFloat()
+            PREVIEW_MIN_ZOOM_SCALE + t * (1.0f - PREVIEW_MIN_ZOOM_SCALE)
+        }
+    }
+
+    private fun zoomScaleToPosition(scale: Float): Float {
+        return if (scale >= 1.0f) {
+            ZOOM_FIT_POSITION + (100f - ZOOM_FIT_POSITION) * (scale - 1.0f) / (PREVIEW_MAX_ZOOM_SCALE - 1.0f)
+        } else {
+            ZOOM_FIT_POSITION * (scale - PREVIEW_MIN_ZOOM_SCALE) / (1.0f - PREVIEW_MIN_ZOOM_SCALE)
+        }.coerceIn(0f, 100f)
+    }
+
+    /**
+     * Scale at which one stream pixel covers one screen pixel, relative to the fit-to-screen
+     * preview box, or null until both the stream size and the box size are known.
+     */
+    private fun oneToOneZoomScale(): Float? {
+        val w = previewLayoutWidthPx
+        val h = previewLayoutHeightPx
+        if (previewStreamWidth <= 0 || previewStreamHeight <= 0 || w <= 0f || h <= 0f) return null
+        /* The SurfaceView box takes the rotated aspect (the renderer rotates the content), so
+         * the stream's width then runs along the box height. The TextureView box is unrotated. */
+        val useSurfaceView = selectedPixelFormatPreference != PixelFormatPreference.H264
+        val boxSpanForStreamWidth = if (useSurfaceView && currentRotation % 180 == 90) h else w
+        return previewStreamWidth / boxSpanForStreamWidth
+    }
+
+    private fun isPreviewZoomedIn(scale: Float): Boolean = scale > 1.0f + ZOOM_PAN_EPSILON
 
     private fun effectivePreviewDimensionsForPan(widthPx: Float, heightPx: Float): Pair<Float, Float> {
         return if (currentRotation % 180 == 90) {
@@ -1211,7 +1277,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun clampZoomPanOffsets(widthPx: Float, heightPx: Float, scale: Float) {
-        if (currentZoom <= 0 || widthPx <= 0f || heightPx <= 0f) {
+        if (!isPreviewZoomedIn(scale) || widthPx <= 0f || heightPx <= 0f) {
             zoomPanOffsetX = 0f
             zoomPanOffsetY = 0f
             return
@@ -1537,7 +1603,13 @@ class MainActivity : ComponentActivity() {
         currentRotation = prefs.getInt(KEY_ROTATION, 0)
         isFlippedHorizontal = prefs.getBoolean(KEY_FLIP_H, false)
         isFlippedVertical = prefs.getBoolean(KEY_FLIP_V, false)
-        currentZoom = prefs.getInt(KEY_ZOOM, 0).coerceIn(0, 100)
+        currentZoom = if (prefs.contains(KEY_ZOOM_POSITION)) {
+            prefs.getInt(KEY_ZOOM_POSITION, ZOOM_FIT_POSITION)
+        } else {
+            // Legacy slider: 0 = fit, 100 = max zoom; now the upper half of the slider.
+            ZOOM_FIT_POSITION + prefs.getInt(KEY_ZOOM, 0).coerceIn(0, 100) * (100 - ZOOM_FIT_POSITION) / 100
+        }.coerceIn(0, 100)
+        isOneToOneZoom = prefs.getBoolean(KEY_ZOOM_ONE_TO_ONE, false)
         audioVolumePercent = prefs.getInt(KEY_VOLUME, 100).coerceIn(0, 100)
         audioMuted = prefs.getBoolean(KEY_MUTED, false)
     }
@@ -1552,7 +1624,8 @@ class MainActivity : ComponentActivity() {
             .putInt(KEY_ROTATION, currentRotation)
             .putBoolean(KEY_FLIP_H, isFlippedHorizontal)
             .putBoolean(KEY_FLIP_V, isFlippedVertical)
-            .putInt(KEY_ZOOM, currentZoom)
+            .putInt(KEY_ZOOM_POSITION, currentZoom)
+            .putBoolean(KEY_ZOOM_ONE_TO_ONE, isOneToOneZoom)
             .putInt(KEY_VOLUME, audioVolumePercent)
             .putBoolean(KEY_MUTED, audioMuted)
             .apply()
@@ -1562,7 +1635,7 @@ class MainActivity : ComponentActivity() {
     private fun MainScreen() {
         val baseScale = previewZoomScale()
         LaunchedEffect(
-            currentZoom,
+            baseScale,
             currentRotation,
             isFlippedHorizontal,
             isFlippedVertical,
@@ -1595,13 +1668,14 @@ class MainActivity : ComponentActivity() {
             if (useSurfaceView) {
                 LaunchedEffect(
                     currentRotation, isFlippedHorizontal, isFlippedVertical, baseScale,
-                    currentZoom, zoomPanOffsetX, zoomPanOffsetY,
+                    zoomPanOffsetX, zoomPanOffsetY,
                     previewLayoutWidthPx, previewLayoutHeightPx,
                 ) {
                     val w = previewLayoutWidthPx
                     val h = previewLayoutHeightPx
-                    val panX = if (currentZoom > 0 && w > 0f) 2f * zoomPanOffsetX / w else 0f
-                    val panY = if (currentZoom > 0 && h > 0f) -2f * zoomPanOffsetY / h else 0f
+                    val zoomedIn = isPreviewZoomedIn(baseScale)
+                    val panX = if (zoomedIn && w > 0f) 2f * zoomPanOffsetX / w else 0f
+                    val panY = if (zoomedIn && h > 0f) -2f * zoomPanOffsetY / h else 0f
                     previewBackend.setPreviewTransform(
                         currentRotation, isFlippedHorizontal, isFlippedVertical, baseScale, panX, panY,
                     )
@@ -1630,13 +1704,12 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                             .pointerInput(
-                                currentZoom,
                                 currentRotation,
                                 isFlippedHorizontal,
                                 isFlippedVertical,
                                 baseScale,
                             ) {
-                                if (currentZoom <= 0) return@pointerInput
+                                if (!isPreviewZoomedIn(baseScale)) return@pointerInput
                                 detectDragGestures { change, dragAmount ->
                                     change.consume()
                                     val (dx, dy) = transformDragToPanDelta(dragAmount.x, dragAmount.y)
@@ -1660,8 +1733,9 @@ class MainActivity : ComponentActivity() {
                                     scaleX = baseScale * if (isFlippedHorizontal) -1f else 1f
                                     scaleY = baseScale * if (isFlippedVertical) -1f else 1f
                                     rotationZ = currentRotation.toFloat()
-                                    translationX = if (currentZoom > 0) zoomPanOffsetX else 0f
-                                    translationY = if (currentZoom > 0) zoomPanOffsetY else 0f
+                                    val zoomedIn = isPreviewZoomedIn(baseScale)
+                                    translationX = if (zoomedIn) zoomPanOffsetX else 0f
+                                    translationY = if (zoomedIn) zoomPanOffsetY else 0f
                                 }
                             },
                         update = {
@@ -1702,6 +1776,19 @@ class MainActivity : ComponentActivity() {
                         .padding(16.dp)
                         .background(Color(0x99000000), RoundedCornerShape(4.dp))
                         .padding(6.dp),
+                )
+            }
+
+            if (isOneToOneNoticeVisible && isPlaybackRunningUi) {
+                Text(
+                    text = getString(R.string.notice_zoom_one_to_one),
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(8.dp)
+                        .background(Color.DarkGray, RoundedCornerShape(8.dp))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
                 )
             }
 
@@ -2072,19 +2159,22 @@ class MainActivity : ComponentActivity() {
             BarDivider()
             Icon(painterResource(R.drawable.ic_zoom_out), null, tint = Color.White, modifier = Modifier.size(24.dp))
             WhiteSlider(
-                value = currentZoom.toFloat(),
+                value = if (isOneToOneZoom) zoomScaleToPosition(previewZoomScale()) else currentZoom.toFloat(),
                 onValueChange = {
-                    currentZoom = it.roundToInt().coerceIn(0, 100)
-                    if (currentZoom == 0) {
-                        zoomPanOffsetX = 0f
-                        zoomPanOffsetY = 0f
+                    // Dragging the slider takes over from 1:1 mode.
+                    if (isOneToOneZoom) applyOneToOneZoom(false)
+                    val position = it.roundToInt().coerceIn(0, 100)
+                    // Snap to fit-to-screen so the preview can't sit at a barely-off scale.
+                    currentZoom = if (abs(position - ZOOM_FIT_POSITION) <= ZOOM_FIT_SNAP_RANGE) {
+                        ZOOM_FIT_POSITION
                     } else {
-                        clampZoomPanOffsets(
-                            previewLayoutWidthPx,
-                            previewLayoutHeightPx,
-                            previewZoomScale(),
-                        )
+                        position
                     }
+                    clampZoomPanOffsets(
+                        previewLayoutWidthPx,
+                        previewLayoutHeightPx,
+                        previewZoomScale(),
+                    )
                     resetControlsTimer()
                 },
                 onValueChangeFinished = {
@@ -2093,6 +2183,8 @@ class MainActivity : ComponentActivity() {
                 },
             )
             Icon(painterResource(R.drawable.ic_zoom_in), null, tint = Color.White, modifier = Modifier.size(24.dp))
+            Spacer(modifier = Modifier.width(12.dp))
+            OneToOneZoomToggle()
             BarDivider()
             IconButton(
                 onClick = {
@@ -2103,6 +2195,41 @@ class MainActivity : ComponentActivity() {
             ) {
                 Icon(painterResource(R.drawable.ic_settings), null, tint = Color.White)
             }
+        }
+    }
+
+    @Composable
+    private fun OneToOneZoomToggle() {
+        val accent = ConsolationColorScheme.primary
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(34.dp)
+                .clip(CircleShape)
+                .border(
+                    1.dp,
+                    if (isOneToOneZoom) accent else Color(0x99FFFFFF),
+                    CircleShape,
+                )
+                .clickable(
+                    onClickLabel = getString(R.string.action_toggle_zoom_one_to_one),
+                ) {
+                    applyOneToOneZoom(!isOneToOneZoom)
+                    clampZoomPanOffsets(
+                        previewLayoutWidthPx,
+                        previewLayoutHeightPx,
+                        previewZoomScale(),
+                    )
+                    persistSettings()
+                    resetControlsTimer()
+                },
+        ) {
+            Text(
+                text = "1:1",
+                color = if (isOneToOneZoom) accent else Color.White,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+            )
         }
     }
 
@@ -2760,8 +2887,16 @@ class MainActivity : ComponentActivity() {
         private const val KEY_ROTATION = "rotation"
         private const val KEY_FLIP_H = "flip_h"
         private const val KEY_FLIP_V = "flip_v"
+        /** Legacy zoom pref (0 = fit); migrated to [KEY_ZOOM_POSITION] on load. */
         private const val KEY_ZOOM = "zoom"
+        private const val KEY_ZOOM_POSITION = "zoom_position"
+        private const val KEY_ZOOM_ONE_TO_ONE = "zoom_one_to_one"
         private const val PREVIEW_MAX_ZOOM_SCALE = 1.7625f // 1.175 * 1.5
+        private const val PREVIEW_MIN_ZOOM_SCALE = 0.5f
+        private const val ZOOM_FIT_POSITION = 50
+        private const val ZOOM_FIT_SNAP_RANGE = 4
+        private const val ONE_TO_ONE_NOTICE_MS = 5_000L
+        private const val ZOOM_PAN_EPSILON = 0.001f
         private const val KEY_VOLUME = "volume"
         private const val KEY_MUTED = "muted"
         private const val KEY_DEVICE_FORMAT_PREFIX = "device_format:"
