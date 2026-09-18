@@ -481,12 +481,28 @@ public class UVCCamera {
     	nativeSetPreviewDisplay(mNativePtr, surface);
     }
 
+	/**
+	 * Rotation (0/90/180/270), mirror flags, zoom scale, pan (in NDC units,
+	 * -1..1 across the surface) and the fit-to-screen content box as a fraction
+	 * of the surface (fitX, fitY &lt;= 1) applied by the native GPU renderer.
+	 * Synchronized with {@link #destroy()}: the UI thread calls this while the
+	 * preview executor may be freeing the native object.
+	 */
+	public synchronized void setPreviewTransform(final int rotationDegrees, final boolean flipH,
+			final boolean flipV, final float scale, final float panXNdc, final float panYNdc,
+			final float fitX, final float fitY) {
+		if (mNativePtr != 0) {
+			nativeSetPreviewTransform(mNativePtr, rotationDegrees, flipH, flipV, scale, panXNdc, panYNdc,
+				fitX, fitY);
+		}
+	}
+
     /**
      * set frame callback
      * @param callback
      * @param pixelFormat
      */
-    public void setFrameCallback(final IFrameCallback callback, final int pixelFormat) {
+    public synchronized void setFrameCallback(final IFrameCallback callback, final int pixelFormat) {
     	if (mNativePtr != 0) {
         	nativeSetFrameCallback(mNativePtr, callback, pixelFormat);
     	}
@@ -499,13 +515,13 @@ public class UVCCamera {
 	 * deliver lightweight rendered-frame notifications so apps can count frames without entering
 	 * the capture path.
 	 */
-	public void setPreviewFrameCallback(final IFrameCallback callback, final int pixelFormat) {
+	public synchronized void setPreviewFrameCallback(final IFrameCallback callback, final int pixelFormat) {
 		if (mNativePtr != 0) {
 			nativeSetPreviewFrameCallback(mNativePtr, callback, pixelFormat);
 		}
 	}
 
-	public long[] getAndResetProcessingStats() {
+	public synchronized long[] getAndResetProcessingStats() {
 		if (mNativePtr != 0) {
 			final long[] stats = nativeGetAndResetProcessingStats(mNativePtr);
 			if (stats != null) {
@@ -1151,6 +1167,9 @@ public class UVCCamera {
     private static final native int nativeStartPreview(final long id_camera);
     private static final native int nativeStopPreview(final long id_camera);
     private static final native int nativeSetPreviewDisplay(final long id_camera, final Surface surface);
+	private static final native int nativeSetPreviewTransform(final long id_camera, final int rotation,
+		final boolean flipH, final boolean flipV, final float scale, final float panX, final float panY,
+		final float fitX, final float fitY);
     private static final native int nativeSetPreviewFrameCallback(final long mNativePtr, final IFrameCallback callback, final int pixelFormat);
     private static final native int nativeSetFrameCallback(final long mNativePtr, final IFrameCallback callback, final int pixelFormat);
 	private static final native long[] nativeGetAndResetProcessingStats(final long mNativePtr);

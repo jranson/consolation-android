@@ -11,6 +11,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.TextureView
 import android.widget.Toast
 import org.centennialoss.consolation.uvc.Size
@@ -47,6 +49,18 @@ class UvccameraLibPreviewBackend(
     private val appContext = context.applicationContext
     private var preferredDevice: CaptureDevice? = null
     private var textureView: TextureView? = null
+    /** SurfaceView target (all formats except H264, which stays on TextureView). */
+    private var surfaceView: SurfaceView? = null
+
+    /** Latest transform from the UI; re-applied whenever a camera starts. */
+    private var xformRotation = 0
+    private var xformFlipH = false
+    private var xformFlipV = false
+    private var xformScale = 1f
+    private var xformPanX = 0f
+    private var xformPanY = 0f
+    private var xformFitX = 1f
+    private var xformFitY = 1f
 
     private var usbMonitorRef: USBMonitor? = null
 
@@ -116,6 +130,8 @@ class UvccameraLibPreviewBackend(
     private var previewRunning: Boolean = false
     private val h264DecoderLock = Any()
     private var h264Decoder: MediaCodec? = null
+    /** True when [h264OutputSurface] was created by us (TextureView path) and must be released. */
+    private var h264OutputSurfaceOwned = false
     private var h264OutputSurface: Surface? = null
     private var h264FramePtsUs = 0L
 
@@ -174,9 +190,21 @@ class UvccameraLibPreviewBackend(
     private var lastNativeIsIsochronous: Boolean = false
     private var lastNativePublishedCountRaw: Long = 0L
 
+    private val holderCallback = object : SurfaceHolder.Callback {
+        override fun surfaceCreated(holder: SurfaceHolder) {
+            requestStartPreview(PreviewTarget.Holder(holder))
+        }
+
+        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+
+        override fun surfaceDestroyed(holder: SurfaceHolder) {
+            stopUvcStreamingAsync()
+        }
+    }
+
     private val surfaceListener = object : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-            requestStartPreview(surface)
+            requestStartPreview(PreviewTarget.Texture(surface))
         }
 
         override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) =
@@ -283,35 +311,102 @@ class UvccameraLibPreviewBackend(
         return null
     }
 
+    /**
+     * Where frames go.  A SurfaceView surface is composited directly by SurfaceFlinger,
+     * skipping the UI-thread vsync hop a TextureView needs; the native GPU renderer then
+     * applies rotation/flip/zoom itself (see [setPreviewTransform]).
+     */
+    private sealed class PreviewTarget {
+        data class Texture(val surfaceTexture: SurfaceTexture) : PreviewTarget()
+        data class Holder(val holder: SurfaceHolder) : PreviewTarget()
+    }
+
     override fun bindPreviewSurface(surfaceHandle: Any?) {
-        textureView = surfaceHandle as? TextureView ?: return
-        val view = textureView ?: return
-        view.applyForUsbPreviewLatency()
-        view.surfaceTextureListener = surfaceListener
-        if (view.isAvailable) {
-            val tex = view.surfaceTexture ?: return
-            requestStartPreview(tex)
+        when (surfaceHandle) {
+            is SurfaceView -> {
+                textureView?.surfaceTextureListener = null
+                textureView = null
+                surfaceView = surfaceHandle
+                val holder = surfaceHandle.holder
+                holder.addCallback(holderCallback)
+                if (holder.surface?.isValid == true) {
+                    requestStartPreview(PreviewTarget.Holder(holder))
+                }
+            }
+            is TextureView -> {
+                surfaceView?.holder?.removeCallback(holderCallback)
+                surfaceView = null
+                textureView = surfaceHandle
+                surfaceHandle.applyForUsbPreviewLatency()
+                surfaceHandle.surfaceTextureListener = surfaceListener
+                if (surfaceHandle.isAvailable) {
+                    val tex = surfaceHandle.surfaceTexture ?: return
+                    requestStartPreview(PreviewTarget.Texture(tex))
+                }
+            }
+            else -> return
         }
     }
 
-    override fun unbindPreviewSurface() {
+    private fun detachPreviewViews() {
         textureView?.surfaceTextureListener = null
         textureView = null
+        surfaceView?.holder?.removeCallback(holderCallback)
+        surfaceView = null
+    }
+
+    override fun unbindPreviewSurface() {
+        detachPreviewViews()
         stopUvcStreamingAsync()
     }
 
     override fun unbindPreviewSurfaceBlocking() {
-        textureView?.surfaceTextureListener = null
-        textureView = null
+        detachPreviewViews()
         stopUvcStreamingBlocking()
     }
 
+    override fun setPreviewTransform(
+        rotationDegrees: Int,
+        flipHorizontal: Boolean,
+        flipVertical: Boolean,
+        scale: Float,
+        panXNdc: Float,
+        panYNdc: Float,
+        fitScaleX: Float,
+        fitScaleY: Float,
+    ) {
+        xformRotation = rotationDegrees
+        xformFlipH = flipHorizontal
+        xformFlipV = flipVertical
+        xformScale = scale
+        xformPanX = panXNdc
+        xformPanY = panYNdc
+        xformFitX = fitScaleX
+        xformFitY = fitScaleY
+        uvcCamera?.setPreviewTransform(
+            rotationDegrees, flipHorizontal, flipVertical, scale, panXNdc, panYNdc, fitScaleX, fitScaleY,
+        )
+    }
+
+    /** The target currently bound to a view, or null. */
+    private fun currentPreviewTarget(): PreviewTarget? {
+        surfaceView?.holder?.let { h -> if (h.surface?.isValid == true) return PreviewTarget.Holder(h) }
+        textureView?.surfaceTexture?.let { return PreviewTarget.Texture(it) }
+        return null
+    }
+
+    /** True while [target] is still the surface the bound view is showing. */
+    private fun isCurrentTarget(target: PreviewTarget): Boolean = when (target) {
+        is PreviewTarget.Texture -> textureView?.surfaceTexture === target.surfaceTexture
+        is PreviewTarget.Holder -> surfaceView?.holder === target.holder && target.holder.surface?.isValid == true
+    }
+
     /**
-     * [surface] must be the active TextureView surface (typically obtained on the main thread).
+     * [target] must be the active view surface (typically obtained on the main thread).
      */
-    private fun requestStartPreview(surface: SurfaceTexture) {
+    private fun requestStartPreview(target: PreviewTarget) {
         uvcPreviewExecutor.execute {
-            startPreviewIfReadyWithSurface(surface)
+            startPreviewIfReadyWithSurface(target)
         }
     }
 
@@ -534,8 +629,8 @@ class UvccameraLibPreviewBackend(
         if (uvcCamera != null) {
             stopUvcStreamingBlocking()
             mainHandler.post {
-                val tex = textureView?.surfaceTexture ?: return@post
-                requestStartPreview(tex)
+                val target = currentPreviewTarget() ?: return@post
+                requestStartPreview(target)
             }
         }
     }
@@ -674,8 +769,7 @@ class UvccameraLibPreviewBackend(
     }
 
     override fun dispose() {
-        textureView?.surfaceTextureListener = null
-        textureView = null
+        detachPreviewViews()
         val stopped = uvcPreviewExecutor.submit {
             stopUvcStreamingBody()
         }
@@ -791,7 +885,7 @@ class UvccameraLibPreviewBackend(
      * native start/stop: the main thread posts delayed USB-audio runnables that must never block
      * behind a held monitor (frozen UI when native startPreview blocks).
      */
-    private fun startPreviewIfReadyWithSurface(surfaceTexture: SurfaceTexture) {
+    private fun startPreviewIfReadyWithSurface(target: PreviewTarget) {
         val tSession = SystemClock.elapsedRealtime()
         Log.i(
             logTag,
@@ -814,12 +908,12 @@ class UvccameraLibPreviewBackend(
             Log.d(logTag, "playback: abort no USB permission")
             return
         }
-        if (textureView == null) {
-            Log.d(logTag, "playback: abort no textureView")
+        if (textureView == null && surfaceView == null) {
+            Log.d(logTag, "playback: abort no preview view")
             return
         }
-        if (textureView?.surfaceTexture !== surfaceTexture) {
-            Log.i(logTag, "playback: abort stale SurfaceTexture before UVC open")
+        if (!isCurrentTarget(target)) {
+            Log.i(logTag, "playback: abort stale preview surface before UVC open")
             return
         }
 
@@ -887,9 +981,23 @@ class UvccameraLibPreviewBackend(
                 Log.i(logTag, "playback: usb bandwidth hint unavailable; auto prefers uncompressed")
             }
             val autoOrder = buildAutoFormatOrder(nativeFrameFormat, lowBandwidthHint == true)
-            val selectedOrder = preferredPixelFormatOverride?.let { pref ->
+            val requestedOrder = preferredPixelFormatOverride?.let { pref ->
                 listOf(pref) + autoOrder.filter { it != pref }
             } ?: autoOrder
+            /* The UI binds a SurfaceView for every non-H.264 request and relies on the native
+             * renderer for rotation/mirror/zoom/pan. MediaCodec output bypasses that renderer (and
+             * Compose cannot transform a SurfaceView), so never fall back to H.264 on a holder. */
+            val selectedOrder = if (target is PreviewTarget.Holder &&
+                preferredPixelFormatOverride != UVCCamera.FRAME_FORMAT_H264
+            ) {
+                requestedOrder.filter { it != UVCCamera.FRAME_FORMAT_H264 }.also {
+                    if (it.size != requestedOrder.size) {
+                        Log.i(logTag, "playback: H.264 fallback excluded for SurfaceView target")
+                    }
+                }
+            } else {
+                requestedOrder
+            }
             val selectedFrameFormat = selectedOrder.firstNotNullOfOrNull { format ->
                 trySetPreviewSize(camera, width, height, minFps, maxFps, fps, format, bwFactor).also {
                     if (it != null) {
@@ -905,21 +1013,42 @@ class UvccameraLibPreviewBackend(
             currentFpsConfigured = fps
             currentPixelFormat = frameFormatName(selectedFrameFormat)
 
-            if (textureView?.surfaceTexture !== surfaceTexture) {
-                Log.i(logTag, "playback: abort stale SurfaceTexture after UVC negotiation")
+            if (!isCurrentTarget(target)) {
+                Log.i(logTag, "playback: abort stale preview surface after UVC negotiation")
                 stopUvcStreamingBody()
                 return
             }
 
-            surfaceTexture.setDefaultBufferSize(width, height)
-            if (selectedFrameFormat == UVCCamera.FRAME_FORMAT_H264) {
-                t1 = SystemClock.elapsedRealtime()
-                startH264Decoder(surfaceTexture, width, height)
-                Log.i(logTag, "playback: startH264Decoder ${SystemClock.elapsedRealtime() - t1}ms")
-            } else {
-                t1 = SystemClock.elapsedRealtime()
-                camera.setPreviewTexture(surfaceTexture)
-                Log.i(logTag, "playback: setPreviewTexture ${SystemClock.elapsedRealtime() - t1}ms")
+            when (target) {
+                is PreviewTarget.Texture -> {
+                    target.surfaceTexture.setDefaultBufferSize(width, height)
+                    if (selectedFrameFormat == UVCCamera.FRAME_FORMAT_H264) {
+                        t1 = SystemClock.elapsedRealtime()
+                        startH264Decoder(Surface(target.surfaceTexture), width, height, ownsSurface = true)
+                        Log.i(logTag, "playback: startH264Decoder ${SystemClock.elapsedRealtime() - t1}ms")
+                    } else {
+                        t1 = SystemClock.elapsedRealtime()
+                        camera.setPreviewTexture(target.surfaceTexture)
+                        Log.i(logTag, "playback: setPreviewTexture ${SystemClock.elapsedRealtime() - t1}ms")
+                    }
+                }
+                is PreviewTarget.Holder -> {
+                    /* Buffer geometry is set natively (ANativeWindow_setBuffersGeometry);
+                     * SurfaceFlinger scales the frame-sized buffers to the view. */
+                    if (selectedFrameFormat == UVCCamera.FRAME_FORMAT_H264) {
+                        t1 = SystemClock.elapsedRealtime()
+                        startH264Decoder(target.holder.surface, width, height, ownsSurface = false)
+                        Log.i(logTag, "playback: startH264Decoder(surface) ${SystemClock.elapsedRealtime() - t1}ms")
+                    } else {
+                        t1 = SystemClock.elapsedRealtime()
+                        camera.setPreviewDisplay(target.holder.surface)
+                        Log.i(logTag, "playback: setPreviewDisplay ${SystemClock.elapsedRealtime() - t1}ms")
+                    }
+                    camera.setPreviewTransform(
+                        xformRotation, xformFlipH, xformFlipV, xformScale, xformPanX, xformPanY,
+                        xformFitX, xformFitY,
+                    )
+                }
             }
 
             loggedFirstVideoFrame.set(false)
@@ -1102,9 +1231,9 @@ class UvccameraLibPreviewBackend(
         )
     }
 
-    private fun startH264Decoder(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
+    private fun startH264Decoder(surface: Surface, width: Int, height: Int, ownsSurface: Boolean) {
         stopH264Decoder()
-        val surface = Surface(surfaceTexture)
+        h264OutputSurfaceOwned = ownsSurface
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
         val decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         decoder.configure(format, surface, null, 0)
@@ -1129,7 +1258,10 @@ class UvccameraLibPreviewBackend(
         }
         runCatching { decoder?.stop() }
         runCatching { decoder?.release() }
-        runCatching { surface?.release() }
+        if (h264OutputSurfaceOwned) {
+            runCatching { surface?.release() }
+        }
+        h264OutputSurfaceOwned = false
     }
 
     private fun queueH264Frame(encodedFrame: ByteBuffer) {

@@ -295,8 +295,10 @@ typedef struct uvc_device_info {
 #ifndef LIBUVC_NUM_TRANSFER_BUFS
 #define LIBUVC_NUM_TRANSFER_BUFS 24
 #endif
+/* Sized for the ISO ring (stream_iso.c: 128 transfers x 8 packets).  The
+ * per-slot arrays are pointers and bytes, so 128 costs ~2.5 KB per stream. */
 #ifndef LIBUVC_MAX_TRANSFER_BUFS
-#define LIBUVC_MAX_TRANSFER_BUFS 32
+#define LIBUVC_MAX_TRANSFER_BUFS 128
 #endif
 #if LIBUVC_NUM_TRANSFER_BUFS > LIBUVC_MAX_TRANSFER_BUFS
 #error "LIBUVC_NUM_TRANSFER_BUFS cannot exceed LIBUVC_MAX_TRANSFER_BUFS array capacity"
@@ -328,7 +330,26 @@ struct uvc_stream_handle {
   uint32_t pts, hold_pts;
   uint32_t last_scr, hold_last_scr;
   uint64_t frame_start_monotonic_ns, frame_complete_monotonic_ns, hold_start_monotonic_ns;
+  uint32_t hold_sample_hash;
+  uint16_t iso_trace_len[UVC_ISO_TRACE_MAX], hold_iso_trace_len[UVC_ISO_TRACE_MAX];
+  uint8_t iso_trace_flags[UVC_ISO_TRACE_MAX], hold_iso_trace_flags[UVC_ISO_TRACE_MAX];
+  uint16_t iso_trace_count, hold_iso_trace_count;
   size_t got_bytes, hold_bytes;
+  /* Incremental MJPEG marker scan of outbuf (see _uvc_mjpeg_note_payload_append):
+   * mjpeg_scan_pos = next pair index to examine; flags accumulate per frame.
+   * Lets _uvc_swap_buffers validate without a second full pass over the JPEG. */
+  size_t mjpeg_scan_pos;
+  uint8_t mjpeg_scan_found_sos;
+  uint8_t mjpeg_scan_embedded_soi;
+  /* After an MJPEG frame is published on its EOI marker, remaining payloads
+   * with the same FID (padding, header-only EOF packets) are ignored until the
+   * FID flips, so they cannot start a bogus SOI-less frame. */
+  uint8_t mjpeg_eoi_skip_valid;
+  uint8_t mjpeg_eoi_skip_fid;
+  /* EOI seen but the frame is held until its trailing UVC status is known:
+   * a later header-only payload may still carry EOF/ERR for this frame. */
+  uint8_t mjpeg_eoi_pending;
+  const char *mjpeg_eoi_pending_reason;
   size_t size_buf;	// XXX add for boundary check
   uint8_t *outbuf, *holdbuf;
   uint8_t *frame_pool[LIBUVC_FRAME_POOL_SLOTS];
@@ -372,6 +393,8 @@ struct uvc_stream_handle {
   uint16_t diag_bulk_timeout_count_before_payload;
   uint32_t diag_mjpeg_publish_count;
   uint32_t diag_mjpeg_drop_count;
+  /* Payload headers seen with the BFH ERR bit set (rate-limits the log line). */
+  uint32_t diag_bfh_err_packets;
   uint32_t diag_selected_frame_interval_100ns;
   int32_t diag_selected_altsetting;
   uint8_t diag_selected_isochronous;

@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <stdlib.h>
+#include <math.h>
 #include <linux/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -45,6 +46,10 @@
 #include "libuvc_internal.h"
 
 #include <sys/resource.h>
+#include <android/hardware_buffer.h>
+#include <sys/stat.h>
+#include <sys/system_properties.h>
+#include <stdio.h>
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -96,6 +101,99 @@ static inline void atomic_store_max(std::atomic<uint64_t> &target, uint64_t valu
 	}
 }
 
+} // namespace
+
+/* Frame-buffer integrity probe: each hop re-samples the bytes it is about to
+ * read and compares with the fingerprint taken when they were produced.  A
+ * mismatch means something wrote into the buffer while it was in flight, and
+ * the stage name says between which two threads.  Reads ~1 KiB per check. */
+#ifndef UVC_FRAME_INTEGRITY_CHECK
+#define UVC_FRAME_INTEGRITY_CHECK 1
+#endif
+
+namespace {
+static bool frame_integrity_ok(const uvc_frame_t *frame, const char *stage,
+	std::atomic<uint32_t> &mismatches)
+{
+#if UVC_FRAME_INTEGRITY_CHECK
+	if (!frame || !frame->data || !frame->integrity_sample_hash)
+		return true;
+	const size_t len = frame->actual_bytes ? frame->actual_bytes : frame->data_bytes;
+	const uint32_t now = uvc_frame_sample_hash(frame->data, len);
+	if (LIKELY(now == frame->integrity_sample_hash))
+		return true;
+	const uint32_t n = mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n <= 10 || !(n % 100))
+		LOGW("frame-integrity: buffer changed in flight stage=%s count=%u seq=%u bytes=%zu "
+			"expected=%08x now=%08x fmt=%d slot=%u",
+			stage, n, frame->sequence, len, frame->integrity_sample_hash, now,
+			frame->frame_format, frame->library_frame_slot);
+	return false;
+#else
+	(void)frame; (void)stage; (void)mismatches;
+	return true;
+#endif
+}
+/* Debug-only raw MJPEG dump, driven by a system property so it costs nothing
+ * unless armed:  adb shell setprop debug.consolation.mjpeg_dump <N>
+ * dumps the next N consecutive frames handed to the async decoder into
+ * /data/data/<pkg>/cache/mjpeg_dump/<seq>.jpg (pull with `adb shell run-as`).
+ * Setting a different value re-arms it. The property is polled once per
+ * 60 frames so the hot path pays one property read per second at most. */
+static void debug_mjpeg_dump_maybe(const uvc_frame_t *frame)
+{
+	static char s_armed_value[PROP_VALUE_MAX] = {};
+	static int s_remaining = 0;
+	static uint32_t s_poll = 0;
+	static const char *s_dir = "/data/data/org.centennialoss.consolation/cache/mjpeg_dump";
+
+	if (!frame || !frame->data || !frame->actual_bytes)
+		return;
+	if (s_remaining <= 0) {
+		if ((s_poll++ % 60) != 0)
+			return;
+		char value[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.consolation.mjpeg_dump", value) <= 0
+				|| !value[0] || !strcmp(value, s_armed_value))
+			return;
+		strncpy(s_armed_value, value, sizeof(s_armed_value) - 1);
+		s_remaining = atoi(value);
+		if (s_remaining <= 0)
+			return;
+		mkdir(s_dir, 0755);
+		LOGW("mjpeg-dump: armed for %d frames -> %s", s_remaining, s_dir);
+	}
+	char path[256];
+	snprintf(path, sizeof(path), "%s/%06u.jpg", s_dir, frame->sequence);
+	FILE *f = fopen(path, "wb");
+	if (!f) {
+		LOGW("mjpeg-dump: cannot open %s", path);
+		s_remaining = 0;
+		return;
+	}
+	fwrite(frame->data, 1, frame->actual_bytes, f);
+	fclose(f);
+	/* Sidecar: one line per USB packet "len flags cumulative_image_bytes". */
+	snprintf(path, sizeof(path), "%s/%06u.pkts", s_dir, frame->sequence);
+	f = fopen(path, "w");
+	if (f) {
+		size_t cum = 0;
+		for (unsigned i = 0; i < frame->iso_trace_count; i++) {
+			const unsigned len = frame->iso_trace_len[i];
+			const unsigned fl = frame->iso_trace_flags[i];
+			if (!(fl & 8u) && len > 12)
+				cum += len - 12;
+			fprintf(f, "%u %u %zu\n", len, fl, cum);
+		}
+		fclose(f);
+	}
+	if (--s_remaining == 0)
+		LOGW("mjpeg-dump: done");
+}
+
+static std::atomic<uint32_t> g_integrity_mismatch_cb{0};
+static std::atomic<uint32_t> g_integrity_mismatch_decode{0};
+static std::atomic<uint32_t> g_integrity_mismatch_render{0};
 } // namespace
 
 /** processingUvcSeqState bit63 marks the last-sequence value as valid. */
@@ -224,6 +322,7 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	ENTER();
 	pthread_cond_init(&preview_sync, NULL);
 	pthread_mutex_init(&preview_mutex, NULL);
+	pthread_mutex_init(&preview_queue_mutex, NULL);
 	pthread_cond_init(&mjpeg_decode_sync, NULL);
 	pthread_mutex_init(&mjpeg_decode_mutex, NULL);
 //
@@ -233,7 +332,318 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	pthread_mutex_init(&pool_mutex, NULL);
 	iframecallback_fields.onFrame = nullptr;
 	preview_iframecallback_fields.onFrame = nullptr;
+	memset(mjpeg_header_slots, 0, sizeof(mjpeg_header_slots));
+	memset(mjpeg_header_used, 0, sizeof(mjpeg_header_used));
+	{
+		static const float identity[9] = { 1, 0, 0,  0, 1, 0,  0, 0, 1 };
+		memcpy(mPreviewXform, identity, sizeof(mPreviewXform));
+	}
+	mPreviewFitX = 1.0f;
+	mPreviewFitY = 1.0f;
+	mPreviewGeomWidth = 0;
+	mPreviewGeomHeight = 0;
+	mPreviewSurfaceSizeDirty = false;
+	memset(mGpuPlanar, 0, sizeof(mGpuPlanar));
+	for (int i = 0; i < GPU_PLANAR_POOL_SZ; i++)
+		mGpuPlanar[i].fence_fd = -1;
+	mGpuPlanarNext = 0;
+	mGpuPlanarRenderFailures = 0;
+	mMergedRender = true;
+	{
+		/* Pick a GPU-sampleable buffer format for the zero-copy planar path.
+		 * R8 is the natural fit but many gralloc implementations reject it;
+		 * RGBA8 a quarter as wide (4 plane bytes per texel) is universal. */
+		/* CPU_READ_OFTEN is requested first on purpose: gralloc then gives a
+		 * cached CPU mapping (write-combined memory is very slow for libjpeg's
+		 * 8x8-block write pattern) and cleans the cache on unlock for the GPU. */
+		struct { uint32_t format; uint64_t usage; uint32_t bpt; const char *name; } cands[] = {
+			{ AHARDWAREBUFFER_FORMAT_R8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN
+				| AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 1, "R8 (cached)" },
+			{ AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN
+				| AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 4, "packed RGBA8 (cached)" },
+			{ AHARDWAREBUFFER_FORMAT_R8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_CPU_READ_RARELY
+				| AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 1, "R8" },
+			{ AHARDWAREBUFFER_FORMAT_R8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+			  1, "R8 (write-only)" },
+			{ AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_CPU_READ_RARELY
+				| AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 4, "packed RGBA8" },
+			{ AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+			  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+			  4, "packed RGBA8 (write-only)" },
+		};
+		mGpuPlanarEnabled = false;
+		mGpuPlanarFormat = 0;
+		mGpuPlanarUsage = 0;
+		mGpuPlanarBytesPerTexel = 1;
+		for (size_t c = 0; c < sizeof(cands) / sizeof(cands[0]); c++) {
+			AHardwareBuffer_Desc probe;
+			memset(&probe, 0, sizeof(probe));
+			probe.width = 64;
+			probe.height = 64;
+			probe.layers = 1;
+			probe.format = cands[c].format;
+			probe.usage = cands[c].usage;
+			/* AHardwareBuffer_isSupported() is API 29+; actually allocating a
+			 * small buffer is the portable equivalent and answers the same
+			 * question more honestly. This runs once at preview setup. */
+			AHardwareBuffer *probe_buf = NULL;
+			if (AHardwareBuffer_allocate(&probe, &probe_buf) == 0 && probe_buf) {
+				AHardwareBuffer_release(probe_buf);
+				mGpuPlanarEnabled = true;
+				mGpuPlanarFormat = cands[c].format;
+				mGpuPlanarUsage = cands[c].usage;
+				mGpuPlanarBytesPerTexel = cands[c].bpt;
+				LOGI("gpu-planar: zero-copy decode targets enabled using %s AHardwareBuffers",
+					cands[c].name);
+				break;
+			}
+		}
+		if (!mGpuPlanarEnabled)
+			LOGI("gpu-planar: no GPU-sampleable CPU-writable buffer format; using texture upload");
+	}
 	EXIT();
+}
+
+/* ---- zero-copy planar MJPEG targets ------------------------------------ */
+
+void UVCPreview::gpu_planar_free_slot(GpuPlanarFrame *g)
+{
+	for (int i = 0; i < 3; i++) {
+		if (g->ahb[i]) {
+			AHardwareBuffer_release((AHardwareBuffer *)g->ahb[i]);
+			g->ahb[i] = NULL;
+		}
+		g->ids[i] = 0;
+		g->w[i] = g->h[i] = g->stride[i] = 0;
+	}
+	if (g->fence_fd >= 0) {
+		close(g->fence_fd);
+		g->fence_fd = -1;
+	}
+}
+
+bool UVCPreview::gpu_planar_alloc_plane(GpuPlanarFrame *g, int i,
+	uint32_t width, uint32_t height)
+{
+	static std::atomic<uint64_t> s_next_id{1};
+	AHardwareBuffer_Desc desc;
+	AHardwareBuffer *buf = NULL;
+	const uint32_t bpt = mGpuPlanarBytesPerTexel;
+	memset(&desc, 0, sizeof(desc));
+	desc.width = (width + bpt - 1) / bpt;	/* texels; 4 plane bytes per RGBA texel */
+	desc.height = height;
+	desc.layers = 1;
+	desc.format = mGpuPlanarFormat;
+	desc.usage = mGpuPlanarUsage;
+	if (AHardwareBuffer_allocate(&desc, &buf) != 0 || !buf)
+		return false;
+	AHardwareBuffer_describe(buf, &desc);
+	g->ahb[i] = buf;
+	g->ids[i] = s_next_id.fetch_add(1, std::memory_order_relaxed);
+	g->w[i] = width;
+	g->h[i] = height;
+	g->stride[i] = desc.stride * bpt;	/* row pitch in bytes */
+	return true;
+}
+
+uvc_frame_t *UVCPreview::gpu_planar_get(const uint32_t widths[3], const uint32_t heights[3])
+{
+	GpuPlanarFrame *g = NULL;
+	pthread_mutex_lock(&pool_mutex);
+	/* Round-robin so the slot handed out is the one the GPU finished with
+	 * longest ago; its read fence is then almost always already signalled. */
+	for (int n = 0; n < GPU_PLANAR_POOL_SZ; n++) {
+		GpuPlanarFrame *c = &mGpuPlanar[(mGpuPlanarNext + n) % GPU_PLANAR_POOL_SZ];
+		if (!c->in_use) {
+			c->in_use = true;
+			mGpuPlanarNext = (unsigned)((c - mGpuPlanar) + 1) % GPU_PLANAR_POOL_SZ;
+			g = c;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&pool_mutex);
+	if (!g)
+		return NULL;
+
+	for (int i = 0; i < 3; i++) {
+		if (!widths[i]) {
+			if (g->ahb[i]) {
+				AHardwareBuffer_release((AHardwareBuffer *)g->ahb[i]);
+				g->ahb[i] = NULL;
+				g->ids[i] = 0;
+			}
+			g->w[i] = g->h[i] = g->stride[i] = 0;
+			continue;
+		}
+		if (g->ahb[i] && g->w[i] == widths[i] && g->h[i] == heights[i])
+			continue;
+		if (g->ahb[i]) {
+			AHardwareBuffer_release((AHardwareBuffer *)g->ahb[i]);
+			g->ahb[i] = NULL;
+		}
+		if (!gpu_planar_alloc_plane(g, i, widths[i], heights[i])) {
+			LOGW("gpu-planar: AHardwareBuffer_allocate %ux%u R8 failed", widths[i], heights[i]);
+			gpu_planar_put(&g->frame, -1);
+			return NULL;
+		}
+	}
+	return &g->frame;
+}
+
+void UVCPreview::gpu_planar_put(uvc_frame_t *frame, int fence_fd)
+{
+	if (!frame)
+		return;
+	GpuPlanarFrame *g = reinterpret_cast<GpuPlanarFrame *>(frame);	/* frame is first member */
+	pthread_mutex_lock(&pool_mutex);
+	if (g->fence_fd >= 0)
+		close(g->fence_fd);
+	g->fence_fd = fence_fd;
+	g->in_use = false;
+	pthread_mutex_unlock(&pool_mutex);
+}
+
+void UVCPreview::gpu_planar_release_all()
+{
+	pthread_mutex_lock(&pool_mutex);
+	for (int i = 0; i < GPU_PLANAR_POOL_SZ; i++) {
+		gpu_planar_free_slot(&mGpuPlanar[i]);
+		mGpuPlanar[i].in_use = false;
+	}
+	pthread_mutex_unlock(&pool_mutex);
+}
+
+/* Decode `frame` straight into a GPU planar target and queue it for the
+ * preview thread.  Returns true when the frame was handled (queued or
+ * dropped as corrupt); false means the zero-copy path is unavailable and the
+ * caller should fall back to the contiguous decode + texture upload. */
+bool UVCPreview::decode_mjpeg_to_gpu_planar(uvc_frame_t *frame)
+{
+	uint32_t widths[3], heights[3];
+	int subsamp = 0;
+	if (uvc_mjpeg_planar_layout(frame, widths, heights, &subsamp) != UVC_SUCCESS)
+		return false;	/* header problem: let the normal path report it */
+
+	uvc_frame_t *out = gpu_planar_get(widths, heights);
+	if (UNLIKELY(!out)) {
+		if (!mGpuPlanarEnabled)
+			return false;
+		/* Pool exhausted (should not happen with latest-wins): drop this one. */
+		processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	GpuPlanarFrame *g = reinterpret_cast<GpuPlanarFrame *>(out);
+	const int nplanes = widths[1] ? 3 : 1;
+	unsigned char *planes[3] = { NULL, NULL, NULL };
+	int strides[3] = { 0, 0, 0 };
+	int locked = 0;
+	bool ok = true;
+
+	/* The first lock waits on the fence from this slot's last GPU read; the
+	 * fence fd is consumed by the lock, so hand it over exactly once. */
+	int fence = g->fence_fd;
+	g->fence_fd = -1;
+	for (int i = 0; i < nplanes; i++) {
+		void *ptr = NULL;
+		if (AHardwareBuffer_lock((AHardwareBuffer *)g->ahb[i],
+				AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, i == 0 ? fence : -1,
+				NULL, &ptr) != 0 || !ptr) {
+			if (i == 0 && fence >= 0)
+				close(fence);
+			ok = false;
+			break;
+		}
+		planes[i] = (unsigned char *)ptr;
+		strides[i] = (int)g->stride[i];
+		locked = i + 1;
+	}
+
+	uvc_error_t result = UVC_ERROR_OTHER;
+	const uint64_t t_convert = processing_now_ns();
+	if (ok)
+		result = uvc_mjpeg2yuv_planes(frame, planes, strides);
+	for (int i = 0; i < locked; i++)
+		AHardwareBuffer_unlock((AHardwareBuffer *)g->ahb[i], NULL);
+	if (ok)
+		recordPreviewConversionTiming(processing_now_ns() - t_convert);
+
+	if (!ok) {
+		LOGW("gpu-planar: AHardwareBuffer_lock failed; falling back to texture upload");
+		mGpuPlanarEnabled = false;
+		gpu_planar_put(out, -1);
+		return false;
+	}
+	if (result != UVC_SUCCESS) {
+		/* Corrupt or undecodable: same policy as the upload path, frame dropped. */
+		processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+		gpu_planar_put(out, -1);
+		return true;
+	}
+
+	out->width = frame->width;
+	out->height = frame->height;
+	out->frame_format = UVC_FRAME_FORMAT_MJPEG_YUV_PLANAR;
+	out->data = NULL;
+	out->data_bytes = 0;
+	out->actual_bytes = 0;
+	out->library_owns_data = 0;
+	out->step = g->stride[0];
+	out->sequence = frame->sequence;
+	out->capture_time = frame->capture_time;
+	out->arrival_monotonic_ns = frame->arrival_monotonic_ns;
+	out->source = frame->source;
+	out->yuv_subsampling = subsamp;
+	out->integrity_sample_hash = 0;
+	out->yuv_hardware_buffer_bytes_per_texel = mGpuPlanarBytesPerTexel;
+	for (int i = 0; i < 3; i++) {
+		out->yuv_plane_widths[i] = widths[i];
+		out->yuv_plane_heights[i] = heights[i];
+		out->yuv_plane_strides[i] = g->stride[i];
+		out->yuv_plane_offsets[i] = 0;
+		out->yuv_hardware_buffers[i] = widths[i] ? g->ahb[i] : NULL;
+		out->yuv_hardware_buffer_ids[i] = widths[i] ? g->ids[i] : 0;
+	}
+	if (mMergedRender)
+		presentPlanarFrame(out);
+	else
+		addPreviewFrame(out);
+	return true;
+}
+
+uvc_frame_t *UVCPreview::mjpeg_header_get() {
+	uvc_frame_t *header = NULL;
+	pthread_mutex_lock(&mjpeg_decode_mutex);
+	for (int i = 0; i < MJPEG_HEADER_POOL_SZ; i++) {
+		if (!mjpeg_header_used[i]) {
+			mjpeg_header_used[i] = true;
+			header = &mjpeg_header_slots[i];
+			break;
+		}
+	}
+	pthread_mutex_unlock(&mjpeg_decode_mutex);
+	return header;
+}
+
+void UVCPreview::mjpeg_header_put_locked(uvc_frame_t *header) {
+	if (!header)
+		return;
+	const ptrdiff_t i = header - mjpeg_header_slots;
+	if (LIKELY(i >= 0 && i < MJPEG_HEADER_POOL_SZ)) {
+		mjpeg_header_used[i] = false;
+	} else {
+		LOGW("mjpeg_header_put: foreign frame header %p", header);
+	}
+}
+
+void UVCPreview::mjpeg_header_put(uvc_frame_t *header) {
+	pthread_mutex_lock(&mjpeg_decode_mutex);
+	mjpeg_header_put_locked(header);
+	pthread_mutex_unlock(&mjpeg_decode_mutex);
 }
 
 UVCPreview::~UVCPreview() {
@@ -282,6 +692,7 @@ UVCPreview::~UVCPreview() {
 		delete mGpuPreviewRenderer;
 		mGpuPreviewRenderer = NULL;
 	}
+	gpu_planar_release_all();
 	if (mMjpegPreviewYuvFrame) {
 		uvc_free_frame(mMjpegPreviewYuvFrame);
 		mMjpegPreviewYuvFrame = NULL;
@@ -291,6 +702,7 @@ UVCPreview::~UVCPreview() {
 	clearCaptureFrame();
 	clear_pool();
 	pthread_mutex_destroy(&preview_mutex);
+	pthread_mutex_destroy(&preview_queue_mutex);
 	pthread_cond_destroy(&preview_sync);
 	pthread_mutex_destroy(&mjpeg_decode_mutex);
 	pthread_cond_destroy(&mjpeg_decode_sync);
@@ -338,6 +750,10 @@ uvc_frame_t *UVCPreview::get_notification_frame() {
 }
 
 void UVCPreview::recycle_frame(uvc_frame_t *frame) {
+	if (UNLIKELY(gpu_planar_is(frame))) {
+		gpu_planar_put(frame, -1);
+		return;
+	}
 	if (UNLIKELY(frame && frame->data_bytes <= 1 && frame->library_owns_data)) {
 		pthread_mutex_lock(&pool_mutex);
 		if (LIKELY(mNotificationFramePool.size() < FRAME_POOL_SZ)) {
@@ -667,6 +1083,8 @@ int UVCPreview::setPreviewDisplay(ANativeWindow *preview_window) {
 			if (LIKELY(mPreviewWindow)) {
 				ANativeWindow_setBuffersGeometry(mPreviewWindow,
 					frameWidth, frameHeight, previewFormat);
+				mPreviewGeomWidth = frameWidth;
+				mPreviewGeomHeight = frameHeight;
 			}
 		} else if (preview_window) {
 			/* JNI calls ANativeWindow_fromSurface each time; if the pointer matches the
@@ -676,6 +1094,37 @@ int UVCPreview::setPreviewDisplay(ANativeWindow *preview_window) {
 	}
 	pthread_mutex_unlock(&preview_mutex);
 	RETURN(0, int);
+}
+
+int UVCPreview::setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_v,
+	float scale, float pan_x_ndc, float pan_y_ndc, float fit_x, float fit_y) {
+	/* scale (incl. mirror) -> rotate -> fit -> translate.  Rotation happens in the
+	 * NDC of the fit-to-screen content box (which has the rotated aspect), the fit
+	 * step maps that box into the full surface, and the pan is in surface NDC.
+	 * NDC has y up while the screen has y down, so a clockwise on-screen rotation
+	 * by r is (x, y) -> (x cos r + y sin r, -x sin r + y cos r). */
+	if (!(fit_x > 0.0f) || fit_x > 1.0f)
+		fit_x = 1.0f;
+	if (!(fit_y > 0.0f) || fit_y > 1.0f)
+		fit_y = 1.0f;
+	const double r = rotation_degrees * M_PI / 180.0;
+	const float c = (float)cos(r);
+	const float sn = (float)sin(r);
+	const float sx = scale * (flip_h ? -1.0f : 1.0f);
+	const float sy = scale * (flip_v ? -1.0f : 1.0f);
+	/* M = T * F * R * S, column-major for glUniformMatrix3fv (F scales rows). */
+	float m[9];
+	m[0] = fit_x * c * sx;   m[1] = -fit_y * sn * sx;  m[2] = 0.0f;	/* column 0 */
+	m[3] = fit_x * sn * sy;  m[4] = fit_y * c * sy;    m[5] = 0.0f;	/* column 1 */
+	m[6] = pan_x_ndc;        m[7] = pan_y_ndc;         m[8] = 1.0f;	/* column 2 */
+	pthread_mutex_lock(&preview_mutex);
+	memcpy(mPreviewXform, m, sizeof(mPreviewXform));
+	mPreviewFitX = fit_x;
+	mPreviewFitY = fit_y;
+	/* Kotlin re-sends the transform whenever the view's size changes. */
+	mPreviewSurfaceSizeDirty = true;
+	pthread_mutex_unlock(&preview_mutex);
+	return 0;
 }
 
 int UVCPreview::setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format) {
@@ -862,11 +1311,11 @@ int UVCPreview::startPreview() {
 		if (UNLIKELY(result != EXIT_SUCCESS)) {
 			LOGW("UVCCamera::window does not exist/already running/could not create thread etc.");
 			mIsRunning = false;
-			pthread_mutex_lock(&preview_mutex);
+			pthread_mutex_lock(&preview_queue_mutex);
 			{
 				pthread_cond_signal(&preview_sync);
 			}
-			pthread_mutex_unlock(&preview_mutex);
+			pthread_mutex_unlock(&preview_queue_mutex);
 		}
 	}
 	RETURN(result, int);
@@ -877,7 +1326,11 @@ int UVCPreview::stopPreview() {
 	bool b = isRunning();
 	if (LIKELY(b)) {
 		mIsRunning = false;
+		/* Signal under the queue lock so a waiter that has checked isRunning()
+		 * but not yet entered cond_wait cannot miss this wakeup. */
+		pthread_mutex_lock(&preview_queue_mutex);
 		pthread_cond_signal(&preview_sync);
+		pthread_mutex_unlock(&preview_queue_mutex);
 		pthread_mutex_lock(&mjpeg_decode_mutex);
 		pthread_cond_signal(&mjpeg_decode_sync);
 		pthread_mutex_unlock(&mjpeg_decode_mutex);
@@ -1125,19 +1578,34 @@ void UVCPreview::addMjpegDecodeFrame(uvc_frame_t *frame) {
 	if (UNLIKELY(!frame))
 		return;
 
-	uvc_frame_t *queued = uvc_allocate_frame(0);
-	if (UNLIKELY(!queued))
+	/* Stage 1: USB-thread publish -> libuvc callback thread. */
+	if (UNLIKELY(!frame_integrity_ok(frame, "publish->callback", g_integrity_mismatch_cb))) {
+		processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
 		return;
+	}
+	uvc_frame_t *queued = mjpeg_header_get();
+	if (UNLIKELY(!queued)) {
+		/* Pool exhausted: ring full plus both in-flight slots busy.  The ring's
+		 * drop-oldest would have evicted anyway; count it as a queue drop. */
+		processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
 	*queued = *frame;
 	queued->library_owns_data = 0;
-	uvc_frame_retain(queued);
+	if (UNLIKELY(!uvc_frame_retain(queued))) {
+		/* No slot reference: the bytes could be overwritten by the USB thread
+		 * while the decoder reads them. Never hand such a frame to the async
+		 * decoder (sequential overwrite shows as a shredded lower half). */
+		mjpeg_header_put(queued);
+		return;
+	}
 	pthread_mutex_lock(&mjpeg_decode_mutex);
 	if (isRunning() && mjpeg_decode_thread_joinable) {
 		uvc_frame_t *drop = mjpeg_decode_frame_ring.enqueue_drop_oldest_if_full(queued);
 		if (drop) {
 			processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
 			uvc_frame_release(drop);
-			uvc_free_frame(drop);
+			mjpeg_header_put_locked(drop);
 		}
 		queued = NULL;
 		pthread_cond_signal(&mjpeg_decode_sync);
@@ -1145,7 +1613,7 @@ void UVCPreview::addMjpegDecodeFrame(uvc_frame_t *frame) {
 	pthread_mutex_unlock(&mjpeg_decode_mutex);
 	if (queued) {
 		uvc_frame_release(queued);
-		uvc_free_frame(queued);
+		mjpeg_header_put(queued);
 	}
 }
 
@@ -1167,7 +1635,7 @@ void UVCPreview::clearMjpegDecodeFrame() {
 	while (!mjpeg_decode_frame_ring.empty()) {
 		uvc_frame_t *frame = mjpeg_decode_frame_ring.dequeue();
 		uvc_frame_release(frame);
-		uvc_free_frame(frame);
+		mjpeg_header_put_locked(frame);
 	}
 	mjpeg_decode_frame_ring.reset_storage();
 	pthread_mutex_unlock(&mjpeg_decode_mutex);
@@ -1184,20 +1652,85 @@ void *UVCPreview::mjpeg_decode_thread_func(void *vptr_args) {
 }
 
 void UVCPreview::do_mjpeg_decode() {
+	{
+		/* Merged decode+render is chosen once per stream: the EGL context can be
+		 * current on only one thread, so it cannot move between the decode and
+		 * preview threads while running.  A/B: setprop debug.consolation.merged_render 0
+		 * then restart the preview. */
+		char mv[PROP_VALUE_MAX] = {};
+		mMergedRender = true;
+		if (__system_property_get("debug.consolation.merged_render", mv) > 0 && mv[0] == '0')
+			mMergedRender = false;
+		LOGI("merged-render: %s (decode thread %s the planar frame)",
+			mMergedRender ? "on" : "off", mMergedRender ? "renders" : "hands off");
+	}
 	for (; LIKELY(isRunning() && mjpeg_decode_thread_joinable); ) {
 		uvc_frame_t *frame = waitMjpegDecodeFrame();
 		if (!frame)
 			break;
 
+		/* Stage 2: callback thread enqueue -> decode thread dequeue (retained slot). */
+		if (UNLIKELY(!frame_integrity_ok(frame, "callback->decode", g_integrity_mismatch_decode))) {
+			processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+			uvc_frame_release(frame);
+			mjpeg_header_put(frame);
+			continue;
+		}
+		debug_mjpeg_dump_maybe(frame);
+		{
+			/* A/B switch: adb shell setprop debug.consolation.gpu_planar 0|1
+			 * (polled every 60 frames; only honoured if the format probe passed). */
+			static uint32_t s_poll;
+			static int s_forced = -1;	/* -1 unset, 0 off, 1 on */
+			if ((s_poll++ % 60) == 0) {
+				char value[PROP_VALUE_MAX] = {};
+				if (__system_property_get("debug.consolation.gpu_planar", value) > 0 && value[0]) {
+					const int want = value[0] != '0';
+					if (want != s_forced) {
+						s_forced = want;
+						if (mGpuPlanarFormat) {
+							mGpuPlanarEnabled = want != 0;
+							mGpuPlanarRenderFailures = 0;
+							LOGW("gpu-planar: %s by property", want ? "enabled" : "disabled");
+						}
+					}
+				}
+			}
+		}
+		if (mGpuPlanarEnabled && decode_mjpeg_to_gpu_planar(frame)) {
+			uvc_frame_release(frame);
+			mjpeg_header_put(frame);
+			continue;
+		}
 		uvc_frame_t *decoded = get_frame(0);
 		if (LIKELY(decoded)) {
 			const uint64_t t_convert = processing_now_ns();
 			const uvc_error_t result = uvc_mjpeg2yuv_planar(frame, decoded);
 			recordPreviewConversionTiming(processing_now_ns() - t_convert);
 			if (LIKELY(result == UVC_SUCCESS)) {
-				addPreviewFrame(decoded);
+				/* Stage 3 check happens on the preview thread: was the JPEG
+				 * still intact once decoding finished (writer overtook reader)? */
+				if (UNLIKELY(!frame_integrity_ok(frame, "during-decode", g_integrity_mismatch_decode))) {
+					processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+					recycle_frame(decoded);
+					decoded = NULL;
+					uvc_frame_release(frame);
+					mjpeg_header_put(frame);
+					continue;
+				}
+#if UVC_FRAME_INTEGRITY_CHECK
+				decoded->integrity_sample_hash =
+					uvc_frame_sample_hash(decoded->data, decoded->actual_bytes);
+#endif
+				if (mMergedRender)
+					presentPlanarFrame(decoded);
+				else
+					addPreviewFrame(decoded);
 				decoded = NULL;
 			} else {
+				/* Corrupt or undecodable frame: not shown, last good frame stays.
+				 * Surface it in the dropped-frames telemetry counter. */
+				processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
 				UVC_DIAG_LOGI("mjpeg-diag:async-planar-decode-fail seq=%u bytes=%zu result=%d frame=%ux%u",
 					frame->sequence,
 					frame->actual_bytes,
@@ -1209,7 +1742,30 @@ void UVCPreview::do_mjpeg_decode() {
 		if (decoded)
 			recycle_frame(decoded);
 		uvc_frame_release(frame);
-		uvc_free_frame(frame);
+		mjpeg_header_put(frame);
+	}
+}
+
+/* Blacks out the buffer area around a frame decoded at (off_x, off_y); RGBX 0 is black.
+ * Only the letterbox strips are touched, never the frame itself. */
+static void clearLetterbox(uint8_t *bits, size_t row_bytes, int32_t buf_w, int32_t buf_h,
+	uint32_t frame_w, uint32_t frame_h, size_t off_x, size_t off_y) {
+	const size_t px = PREVIEW_PIXEL_BYTES;
+	const size_t right_x = off_x + frame_w;
+	const size_t right_bytes = ((size_t) buf_w - right_x) * px;
+	if (off_y)
+		memset(bits, 0, off_y * row_bytes);
+	const size_t bottom_y = off_y + frame_h;
+	if ((size_t) buf_h > bottom_y)
+		memset(bits + bottom_y * row_bytes, 0, ((size_t) buf_h - bottom_y) * row_bytes);
+	if (off_x || right_bytes) {
+		for (size_t y = off_y; y < bottom_y; ++y) {
+			uint8_t *row = bits + y * row_bytes;
+			if (off_x)
+				memset(row, 0, off_x * px);
+			if (right_bytes)
+				memset(row + right_x * px, 0, right_bytes);
+		}
 	}
 }
 
@@ -1222,11 +1778,29 @@ bool UVCPreview::renderFrameDirectToSurface(uvc_frame_t *frame,
 	ANativeWindow *target = *window;
 	if (LIKELY(target)) {
 		if (mGpuPreviewRenderer) {
+			/* The GPU path renders at the view's own size (1:1 with the screen);
+			 * only the CPU fallback below needs stream-sized buffers. */
+			if (mPreviewGeomWidth || mPreviewGeomHeight) {
+				ANativeWindow_setBuffersGeometry(target, 0, 0, previewFormat);
+				mPreviewGeomWidth = 0;
+				mPreviewGeomHeight = 0;
+				mPreviewSurfaceSizeDirty = true;
+			}
+			if (mPreviewSurfaceSizeDirty) {
+				mGpuPreviewRenderer->invalidateSurfaceSize();
+				mPreviewSurfaceSizeDirty = false;
+			}
+			mGpuPreviewRenderer->setTransform(mPreviewXform);
 			if (frame->frame_format != UVC_FRAME_FORMAT_MJPEG
 					&& mGpuPreviewRenderer->render(frame, target, frame_ready_ns)) {
 				rendered = true;
 				pthread_mutex_unlock(window_mutex);
 				return rendered;
+			}
+			if (gpu_planar_is(frame)) {
+				/* Planes live only in GPU memory: nothing for the CPU path. */
+				pthread_mutex_unlock(window_mutex);
+				return false;
 			}
 			if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG) {
 				if (UNLIKELY(!mMjpegPreviewYuvFrame))
@@ -1254,6 +1828,21 @@ bool UVCPreview::renderFrameDirectToSurface(uvc_frame_t *frame,
 				}
 			}
 		}
+		/* The view fills the screen, so pad the buffer to the screen's shape (the
+		 * compositor then scales it uniformly) and decode the frame into its center. */
+		{
+			int32_t geom_w = (int32_t) frame->width;
+			int32_t geom_h = (int32_t) frame->height;
+			if (mPreviewFitX < 1.0f)
+				geom_w = std::max(geom_w, (int32_t) lroundf(frame->width / mPreviewFitX) & ~1);
+			if (mPreviewFitY < 1.0f)
+				geom_h = std::max(geom_h, (int32_t) lroundf(frame->height / mPreviewFitY) & ~1);
+			if (geom_w != mPreviewGeomWidth || geom_h != mPreviewGeomHeight) {
+				ANativeWindow_setBuffersGeometry(target, geom_w, geom_h, previewFormat);
+				mPreviewGeomWidth = geom_w;
+				mPreviewGeomHeight = geom_h;
+			}
+		}
 		ANativeWindow_Buffer buffer;
 		const uint64_t lock_start_ns = processing_now_ns();
 		if (LIKELY(ANativeWindow_lock(target, &buffer, NULL) == 0)) {
@@ -1261,10 +1850,17 @@ bool UVCPreview::renderFrameDirectToSurface(uvc_frame_t *frame,
 				*surface_wait_ns += processing_now_ns() - lock_start_ns;
 			if (LIKELY(buffer.bits && buffer.width >= (int32_t) frame->width &&
 					buffer.height >= (int32_t) frame->height)) {
+				const size_t row_bytes = (size_t) buffer.stride * PREVIEW_PIXEL_BYTES;
+				const size_t off_x = (size_t) (buffer.width - (int32_t) frame->width) / 2;
+				const size_t off_y = (size_t) (buffer.height - (int32_t) frame->height) / 2;
+				uint8_t *bits = (uint8_t *) buffer.bits;
+				if (off_x || off_y)
+					clearLetterbox(bits, row_bytes, buffer.width, buffer.height,
+						frame->width, frame->height, off_x, off_y);
 				uvc_frame_t surface = {};
-				surface.data = buffer.bits;
-				surface.data_bytes = (size_t) buffer.stride * (size_t) buffer.height
-					* PREVIEW_PIXEL_BYTES;
+				surface.data = bits + off_y * row_bytes + off_x * PREVIEW_PIXEL_BYTES;
+				surface.data_bytes = row_bytes * ((size_t) buffer.height - off_y)
+					- off_x * PREVIEW_PIXEL_BYTES;
 				surface.width = frame->width;
 				surface.height = frame->height;
 				surface.frame_format = UVC_FRAME_FORMAT_RGBX;
@@ -1281,7 +1877,7 @@ bool UVCPreview::renderFrameDirectToSurface(uvc_frame_t *frame,
 				rendered = result == UVC_SUCCESS;
 				if (LIKELY(rendered && frame->frame_format == UVC_FRAME_FORMAT_MJPEG)) {
 					recordMjpegDecodedVisualSample(frame->sequence, frame->actual_bytes,
-						(const uint8_t *)buffer.bits, surface.step, frame->width, frame->height);
+						(const uint8_t *)surface.data, surface.step, frame->width, frame->height);
 				}
 				if (UNLIKELY(result && frame->frame_format == UVC_FRAME_FORMAT_MJPEG)) {
 					UVC_DIAG_LOGI("mjpeg-diag:decode-fail direct seq=%u bytes=%zu result=%d surface=%dx%d stride=%d frame=%ux%u",
@@ -1357,8 +1953,17 @@ uvc_frame_t *UVCPreview::convertPreviewFrameToRgbx(uvc_frame_t *frame) {
 
 void UVCPreview::addPreviewFrame(uvc_frame_t *frame) {
 
-	pthread_mutex_lock(&preview_mutex);
+	pthread_mutex_lock(&preview_queue_mutex);
 	if (isRunning()) {
+		if (frameMode != REQUEST_MODE_H264) {
+			/* Latest-wins for live video: anything still queued is older than
+			 * this frame and would only be shown late.  Recycle it instead. */
+			while (!preview_frame_ring.empty()) {
+				uvc_frame_t *stale = preview_frame_ring.dequeue();
+				processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+				recycle_frame(stale);
+			}
+		}
 		uvc_frame_t *drop = preview_frame_ring.enqueue_drop_oldest_if_full(frame);
 		const uint64_t queued_backlog =
 			preview_frame_ring.size() > 0 ? preview_frame_ring.size() - 1 : 0;
@@ -1374,34 +1979,34 @@ void UVCPreview::addPreviewFrame(uvc_frame_t *frame) {
 		frame = nullptr;
 		pthread_cond_signal(&preview_sync);
 	}
-	pthread_mutex_unlock(&preview_mutex);
+	pthread_mutex_unlock(&preview_queue_mutex);
 	if (frame)
 		recycle_frame(frame);
 }
 
 uvc_frame_t *UVCPreview::waitPreviewFrame() {
 	uvc_frame_t *frame = nullptr;
-	pthread_mutex_lock(&preview_mutex);
+	pthread_mutex_lock(&preview_queue_mutex);
 	{
 		while (isRunning() && preview_frame_ring.empty())
-			pthread_cond_wait(&preview_sync, &preview_mutex);
+			pthread_cond_wait(&preview_sync, &preview_queue_mutex);
 		if (LIKELY(isRunning() && !preview_frame_ring.empty())) {
 			frame = preview_frame_ring.dequeue();
 			recordPreviewQueueDepthSample(static_cast<uint64_t>(preview_frame_ring.size()));
 		}
 	}
-	pthread_mutex_unlock(&preview_mutex);
+	pthread_mutex_unlock(&preview_queue_mutex);
 	return frame;
 }
 
 void UVCPreview::clearPreviewFrame() {
-	pthread_mutex_lock(&preview_mutex);
+	pthread_mutex_lock(&preview_queue_mutex);
 	{
 		while (!preview_frame_ring.empty())
 			recycle_frame(preview_frame_ring.dequeue());
 		preview_frame_ring.reset_storage();
 	}
-	pthread_mutex_unlock(&preview_mutex);
+	pthread_mutex_unlock(&preview_queue_mutex);
 }
 
 void *UVCPreview::preview_thread_func(void *vptr_args) {
@@ -1446,6 +2051,8 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 			if (LIKELY(mPreviewWindow)) {
 				ANativeWindow_setBuffersGeometry(mPreviewWindow,
 					frameWidth, frameHeight, previewFormat);
+				mPreviewGeomWidth = frameWidth;
+				mPreviewGeomHeight = frameHeight;
 			}
 			pthread_mutex_unlock(&preview_mutex);
 		} else {
@@ -1472,6 +2079,58 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 		LOGE("could not negotiate with camera:err=%d", result);
 	}
 	RETURN(result, int);
+}
+
+void UVCPreview::presentPlanarFrame(uvc_frame_t *frame) {
+	uint64_t frame_ready_ns = 0;
+	uint64_t surface_wait_ns = 0;
+	/* Stage 4: decode thread -> preview thread (pool frame). */
+	if (UNLIKELY(!frame_integrity_ok(frame, "decode->render", g_integrity_mismatch_render))) {
+		processingPreviewQueueDropCount.fetch_add(1, std::memory_order_relaxed);
+		recycle_frame(frame);
+		return;
+	}
+	const uint64_t t_render = processing_now_ns();
+	const bool rendered = renderFrameDirectToSurface(frame,
+		&mPreviewWindow, &preview_mutex, &frame_ready_ns,
+		&surface_wait_ns);
+	{
+		/* Per-path render cost (upload+draw+swap), logged every
+		 * 600 frames so the zero-copy path can be A/B'd on device. */
+		static uint64_t s_sum[2], s_max[2];
+		static uint32_t s_n[2];
+		const int path = gpu_planar_is(frame) ? 1 : 0;
+		const uint64_t dt = processing_now_ns() - t_render;
+		s_sum[path] += dt;
+		if (dt > s_max[path]) s_max[path] = dt;
+		if (++s_n[path] == 600) {
+			LOGI("planar-render: path=%s avg_us=%llu max_us=%llu over 600 frames",
+				path ? "zero-copy" : "upload",
+				(unsigned long long)(s_sum[path] / 600 / 1000),
+				(unsigned long long)(s_max[path] / 1000));
+			s_sum[path] = 0; s_max[path] = 0; s_n[path] = 0;
+		}
+	}
+	if (rendered && frame_ready_ns && frame->arrival_monotonic_ns) {
+		recordEndToEndLatencyTiming(frame->arrival_monotonic_ns,
+			frame_ready_ns);
+	}
+	if (gpu_planar_is(frame)) {
+		if (rendered) {
+			mGpuPlanarRenderFailures = 0;
+			gpu_planar_put(frame, mGpuPreviewRenderer
+				? mGpuPreviewRenderer->takeRenderFenceFd() : -1);
+		} else {
+			gpu_planar_put(frame, -1);
+			if (++mGpuPlanarRenderFailures >= 3 && mGpuPlanarEnabled) {
+				LOGW("gpu-planar: render failed %u times; falling back to texture upload",
+					mGpuPlanarRenderFailures);
+				mGpuPlanarEnabled = false;
+			}
+		}
+	} else {
+		recycle_frame(frame);
+	}
 }
 
 void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
@@ -1550,15 +2209,7 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 						continue;
 					}
 					if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG_YUV_PLANAR) {
-						uint64_t frame_ready_ns = 0;
-						uint64_t surface_wait_ns = 0;
-						if (renderFrameDirectToSurface(frame, &mPreviewWindow,
-								&preview_mutex, &frame_ready_ns, &surface_wait_ns)
-								&& frame_ready_ns && frame->arrival_monotonic_ns) {
-							recordEndToEndLatencyTiming(frame->arrival_monotonic_ns,
-								frame_ready_ns);
-						}
-						recycle_frame(frame);
+						presentPlanarFrame(frame);
 						frame = NULL;
 						continue;
 					}

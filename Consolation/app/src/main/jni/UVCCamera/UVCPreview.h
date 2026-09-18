@@ -36,10 +36,14 @@
 
 #pragma interface
 
-/** Preview FIFO depth; drop-oldest on overflow (see BoundedPointerRing). */
+/** Preview FIFO capacity; drop-oldest on overflow (see BoundedPointerRing).
+ * Only H264 uses the depth: encoded access units must not be skipped.  Every
+ * other mode enqueues latest-wins (addPreviewFrame drains older entries), so
+ * a renderer that falls behind never shows a frame older than the newest. */
 #define PREVIEW_QUEUE_MAX 4
-/** MJPEG decode input depth; keep tight to avoid adding frame latency. */
-#define MJPEG_DECODE_QUEUE_MAX 2
+/** MJPEG decode input depth: 1 = the decoder always picks up the newest frame,
+ * the ring never adds more than one frame of latency under load. */
+#define MJPEG_DECODE_QUEUE_MAX 1
 
 #define DEFAULT_PREVIEW_WIDTH 640
 #define DEFAULT_PREVIEW_HEIGHT 480
@@ -75,7 +79,12 @@ private:
 	int frameMode;
 	size_t frameBytes;
 	pthread_t preview_thread;
+	/** Guards mPreviewWindow and the GPU/CPU render into it. */
 	pthread_mutex_t preview_mutex;
+	/** Guards preview_frame_ring + preview_sync only. Kept separate from
+	 * preview_mutex so a producer's enqueue never blocks behind the preview
+	 * thread's render + eglSwapBuffers (which hold preview_mutex). */
+	pthread_mutex_t preview_queue_mutex;
 	pthread_cond_t preview_sync;
 	/** Incoming frames; fixed ring, O(1) enqueue with drop-oldest on overflow */
 	BoundedPointerRing<uvc_frame_t *> preview_frame_ring;
@@ -84,6 +93,48 @@ private:
 	pthread_mutex_t mjpeg_decode_mutex;
 	pthread_cond_t mjpeg_decode_sync;
 	BoundedPointerRing<uvc_frame_t *> mjpeg_decode_frame_ring;
+	/** Fixed pool of frame headers handed to the async MJPEG decoder (ring depth
+	 * + one in flight on each side).  Replaces a malloc/free pair per frame. */
+#define MJPEG_HEADER_POOL_SZ (MJPEG_DECODE_QUEUE_MAX + 2)
+	uvc_frame_t mjpeg_header_slots[MJPEG_HEADER_POOL_SZ];
+	bool mjpeg_header_used[MJPEG_HEADER_POOL_SZ];
+	uvc_frame_t *mjpeg_header_get();
+	void mjpeg_header_put_locked(uvc_frame_t *header);
+	void mjpeg_header_put(uvc_frame_t *header);
+	/** Planar MJPEG decode targets in GPU-sampleable memory: one R8
+	 * AHardwareBuffer per plane, bound by the renderer as EGLImages, so a
+	 * decoded frame reaches the GPU with no upload copy.  Depth: one queued
+	 * (latest-wins) + one rendering + one decoding + one of slack. */
+#define GPU_PLANAR_POOL_SZ 4
+	struct GpuPlanarFrame {
+		uvc_frame_t frame;
+		void *ahb[3];
+		uint64_t ids[3];
+		uint32_t w[3], h[3], stride[3];
+		int fence_fd;		/**< GPU read fence from the last render, -1 = none */
+		bool in_use;
+	};
+	GpuPlanarFrame mGpuPlanar[GPU_PLANAR_POOL_SZ];
+	unsigned mGpuPlanarNext;
+	unsigned mGpuPlanarRenderFailures;
+	volatile bool mGpuPlanarEnabled;
+	uint32_t mGpuPlanarFormat;		/**< AHARDWAREBUFFER_FORMAT_* chosen by the probe */
+	uint64_t mGpuPlanarUsage;
+	uint32_t mGpuPlanarBytesPerTexel;	/**< 1 for R8, 4 for packed RGBA8 */
+	static void gpu_planar_free_slot(GpuPlanarFrame *g);
+	bool gpu_planar_alloc_plane(GpuPlanarFrame *g, int i, uint32_t width, uint32_t height);
+	uvc_frame_t *gpu_planar_get(const uint32_t widths[3], const uint32_t heights[3]);
+	void gpu_planar_put(uvc_frame_t *frame, int fence_fd);
+	void gpu_planar_release_all();
+	static bool gpu_planar_is(const uvc_frame_t *frame) {
+		return frame && frame->yuv_hardware_buffers[0] != NULL;
+	}
+	bool decode_mjpeg_to_gpu_planar(uvc_frame_t *frame);
+	/** Render a decoded planar frame and return it to its pool.  Used by the
+	 * preview thread, or directly by the decode thread when merged rendering
+	 * is on (saves the ring hand-off; costs the decode/render overlap). */
+	void presentPlanarFrame(uvc_frame_t *frame);
+	volatile bool mMergedRender;
 	int previewFormat;
 	size_t previewBytes;
 //
@@ -96,6 +147,17 @@ private:
 	pthread_cond_t capture_sync;
 	uvc_frame_t *captureQueu;			// keep latest frame
 	UVCGpuPreviewRenderer *mGpuPreviewRenderer;
+	float mPreviewXform[9];		/**< guarded by preview_mutex */
+	/** Fit-to-screen content box as a fraction of the preview surface (<= 1 per axis);
+	 * the CPU fallback pads its buffers to this shape.  Guarded by preview_mutex. */
+	float mPreviewFitX;
+	float mPreviewFitY;
+	/** Buffer geometry last applied to mPreviewWindow; 0x0 = the window's own size
+	 * (GPU path).  Guarded by preview_mutex. */
+	int32_t mPreviewGeomWidth;
+	int32_t mPreviewGeomHeight;
+	/** Set when the view may have resized, so the GPU renderer re-reads its surface size. */
+	bool mPreviewSurfaceSizeDirty;
 	uvc_frame_t *mMjpegPreviewYuvFrame;
 	jobject mFrameCallbackObj;
 	convFunc_t mFrameCallbackFunc;
@@ -212,6 +274,13 @@ public:
 	inline const bool isRunning() const;
 	int setPreviewSize(int width, int height, int min_fps, int max_fps, int mode, float bandwidth = 1.0f);
 	int setPreviewDisplay(ANativeWindow *preview_window);
+	/** Rotation (0/90/180/270, clockwise on screen), mirror flags, zoom scale,
+	 * pan in surface NDC units, and the fit-to-screen content box as a fraction
+	 * of the surface (fit_x, fit_y <= 1), applied by the GPU renderer.  Lets the
+	 * preview live in a full-screen SurfaceView, which cannot be rotated or
+	 * mirrored by the View system, while zooming into the letterbox area. */
+	int setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_v,
+		float scale, float pan_x_ndc, float pan_y_ndc, float fit_x, float fit_y);
 	int setPreviewFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int startPreview();

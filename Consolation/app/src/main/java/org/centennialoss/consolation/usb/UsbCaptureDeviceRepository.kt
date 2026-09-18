@@ -11,6 +11,7 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Parcelable
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import org.centennialoss.consolation.core.capture.CaptureDevice
 import org.centennialoss.consolation.logging.AppLog as Log
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -310,4 +311,4 @@ class UsbCaptureDeviceRepository(
 }
 
 private inline fun <reified T : Parcelable> Intent.parcelableExtraCompat(name: String): T? =
-    getParcelableExtra(name, T::class.java)
+    IntentCompat.getParcelableExtra(this, name, T::class.java)

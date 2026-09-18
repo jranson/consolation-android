@@ -11,7 +11,7 @@
 #ifndef LIBUSB_PREALLOC_H
 #define LIBUSB_PREALLOC_H
 
-#include <libusb.h>
+#include "libusb.h"  /* relative to this header: works from any include path */
 
 #ifdef __cplusplus
 extern "C" {

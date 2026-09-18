@@ -45,6 +45,8 @@
 #include <turbojpeg.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <stdio.h>
+#include <string.h>
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -109,6 +111,15 @@ struct mjpeg_decoder_ctx {
 	struct jpeg_decompress_struct dinfo;
 	tjhandle tj;
 	int initialized;
+	/* Planar-decode warning policy (see _mjpeg_planar_warning_tolerated).
+	 * Lives with the decoder instance so one stream's verdict is never
+	 * inherited by another, and is reset when a new stream is detected. */
+	uint32_t warn_drops;
+	uint32_t warn_pad_streak;	/* consecutive frames with verified EOI padding */
+	uint8_t warn_pad_fill;		/* fill byte of that padding */
+	uint8_t warn_pad_logged;
+	uint32_t warn_last_seq;
+	uint32_t warn_width, warn_height;
 };
 
 static pthread_key_t mjpeg_decoder_key;
@@ -722,16 +733,12 @@ fail:
 	return UVC_ERROR_OTHER+1;
 }
 
-uvc_error_t uvc_mjpeg2yuv_planar(uvc_frame_t *in, uvc_frame_t *out) {
+uvc_error_t uvc_mjpeg_planar_layout(uvc_frame_t *in, uint32_t widths[3],
+		uint32_t heights[3], int *subsamp_out) {
 	struct mjpeg_decoder_ctx *decoder;
 	tjhandle tj;
 	int subsamp;
-	int strides[3] = { 0, 0, 0 };
-	unsigned char *planes[3] = { NULL, NULL, NULL };
-	size_t offsets[3] = { 0, 0, 0 };
-	size_t total_bytes = 0;
 
-	out->actual_bytes = 0;
 	if (UNLIKELY(in->frame_format != UVC_FRAME_FORMAT_MJPEG))
 		return UVC_ERROR_INVALID_PARAM;
 	if (UNLIKELY(!in->data || !in->actual_bytes || !in->width || !in->height))
@@ -756,27 +763,182 @@ uvc_error_t uvc_mjpeg2yuv_planar(uvc_frame_t *in, uvc_frame_t *out) {
 		return UVC_ERROR_INVALID_PARAM;
 
 	for (int i = 0; i < 3; i++) {
-		const int plane_width = tj3YUVPlaneWidth(i, (int)in->width, subsamp);
-		const int plane_height = tj3YUVPlaneHeight(i, (int)in->height, subsamp);
-		size_t plane_size;
 		if (i > 0 && subsamp == TJSAMP_GRAY) {
+			widths[i] = 0;
+			heights[i] = 0;
+			continue;
+		}
+		const int pw = tj3YUVPlaneWidth(i, (int)in->width, subsamp);
+		const int ph = tj3YUVPlaneHeight(i, (int)in->height, subsamp);
+		if (UNLIKELY(pw <= 0 || ph <= 0))
+			return UVC_ERROR_INVALID_PARAM;
+		widths[i] = (uint32_t)pw;
+		heights[i] = (uint32_t)ph;
+	}
+	if (subsamp_out)
+		*subsamp_out = subsamp;
+	return UVC_SUCCESS;
+}
+
+/*
+ * libjpeg warnings after a "successful" decode mean the bitstream was damaged:
+ * a few bytes inserted or dropped desyncs the Huffman decoder with no restart
+ * markers, so the top decodes and everything below is shredded, ending in
+ * "premature end" (bytes missing) or "N extraneous bytes before marker" (bytes
+ * inserted).  Both were observed on a MUSB USB 2.0 host; such frames are
+ * dropped so the last good one stays on glass.
+ *
+ * The one benign case is a camera that pads every frame between the end of the
+ * entropy-coded data and EOI.  That is only accepted when it is positively
+ * identified, never merely because the warning is persistent (persistent
+ * transport corruption warns on every frame too):
+ *   - the first (reported) warning is exactly "N extraneous bytes before
+ *     marker 0xd9", so nothing was wrong before the scan data ended,
+ *   - the N bytes immediately before the trailing FFD9 are one repeated fill
+ *     byte (leftover entropy-coded data from a desync is not uniform), and
+ *   - UVC_MJPEG_PAD_TRUST consecutive frames had that shape with the same
+ *     fill byte.
+ * Any other warning rejects the frame and restarts that count.
+ */
+#define UVC_MJPEG_PAD_TRUST 60
+
+static void _mjpeg_planar_warning_track_stream(struct mjpeg_decoder_ctx *ctx,
+		const uvc_frame_t *in) {
+	/* New stream (sequence restarted) or new mode: forget the old verdict. */
+	if (in->sequence < ctx->warn_last_seq
+			|| in->width != ctx->warn_width || in->height != ctx->warn_height) {
+		ctx->warn_drops = 0;
+		ctx->warn_pad_streak = 0;
+		ctx->warn_pad_logged = 0;
+		ctx->warn_width = in->width;
+		ctx->warn_height = in->height;
+	}
+	ctx->warn_last_seq = in->sequence;
+}
+
+static void _mjpeg_planar_warning_clean(struct mjpeg_decoder_ctx *ctx,
+		const uvc_frame_t *in) {
+	_mjpeg_planar_warning_track_stream(ctx, in);
+	ctx->warn_pad_streak = 0;
+	ctx->warn_pad_logged = 0;
+}
+
+/* 1 and *fill set when msg/in describe uniform fill padding before EOI. */
+static int _mjpeg_warning_is_eoi_padding(const uvc_frame_t *in, const char *msg,
+		uint8_t *fill) {
+	const uint8_t *data = (const uint8_t *)in->data;
+	const size_t len = in->actual_bytes;
+	const char *p = msg ? strstr(msg, "Corrupt JPEG data: ") : NULL;
+	unsigned int discarded = 0, marker = 0;
+	size_t i;
+
+	if (!p || sscanf(p, "Corrupt JPEG data: %u extraneous bytes before marker 0x%x",
+			&discarded, &marker) != 2)
+		return 0;
+	if (marker != 0xd9 || !discarded || (size_t)discarded + 4 > len)
+		return 0;
+	if (data[len - 2] != 0xff || data[len - 1] != 0xd9)
+		return 0;
+	*fill = data[len - 3];
+	for (i = 0; i < discarded; i++) {
+		if (data[len - 3 - i] != *fill)
+			return 0;
+	}
+	return 1;
+}
+
+static int _mjpeg_planar_warning_tolerated(struct mjpeg_decoder_ctx *ctx,
+		const uvc_frame_t *in, const char *msg) {
+	uint8_t fill = 0;
+
+	_mjpeg_planar_warning_track_stream(ctx, in);
+	if (_mjpeg_warning_is_eoi_padding(in, msg, &fill)) {
+		if (ctx->warn_pad_streak && fill != ctx->warn_pad_fill)
+			ctx->warn_pad_streak = 0;
+		ctx->warn_pad_fill = fill;
+		if (ctx->warn_pad_streak >= UVC_MJPEG_PAD_TRUST) {
+			if (!ctx->warn_pad_logged) {
+				ctx->warn_pad_logged = 1;
+				LOGW("mjpeg planar decode: every frame is 0x%02x-padded before EOI (%s); accepting",
+					(unsigned)fill, msg);
+			}
+			return 1;
+		}
+		ctx->warn_pad_streak++;
+	} else {
+		ctx->warn_pad_streak = 0;
+		ctx->warn_pad_logged = 0;
+	}
+
+	ctx->warn_drops++;
+	if (ctx->warn_drops <= 5 || !(ctx->warn_drops % 300))
+		LOGW("mjpeg planar decode dropped corrupt frame count=%u seq=%u bytes=%zu warn=%s",
+			ctx->warn_drops, in->sequence, in->actual_bytes, msg ? msg : "?");
+	return 0;
+}
+
+uvc_error_t uvc_mjpeg2yuv_planes(uvc_frame_t *in, unsigned char *planes[3],
+		const int strides[3]) {
+	struct mjpeg_decoder_ctx *decoder;
+	tjhandle tj;
+
+	decoder = _mjpeg_decoder_get();
+	if (UNLIKELY(!decoder))
+		return UVC_ERROR_NO_MEM;
+	tj = _mjpeg_tj_decoder_get(decoder);
+	if (UNLIKELY(!tj))
+		return UVC_ERROR_NO_MEM;
+
+	if (UNLIKELY(tj3DecompressToYUVPlanes8(tj,
+			(const unsigned char *)in->data, in->actual_bytes,
+			planes, (int *)strides) != 0)) {
+		UVC_DIAG_LOGI("mjpeg-diag:planar-decode-fail seq=%u bytes=%zu err=%s",
+			in->sequence,
+			in->actual_bytes,
+			tj3GetErrorStr(tj));
+		return UVC_ERROR_OTHER;
+	}
+	if (UNLIKELY(tj3GetErrorCode(tj) == TJERR_WARNING)) {
+		if (!_mjpeg_planar_warning_tolerated(decoder, in, tj3GetErrorStr(tj)))
+			return UVC_ERROR_OTHER;
+	} else {
+		_mjpeg_planar_warning_clean(decoder, in);
+	}
+	return UVC_SUCCESS;
+}
+
+uvc_error_t uvc_mjpeg2yuv_planar(uvc_frame_t *in, uvc_frame_t *out) {
+	uint32_t widths[3], heights[3];
+	int subsamp = 0;
+	int strides[3] = { 0, 0, 0 };
+	unsigned char *planes[3] = { NULL, NULL, NULL };
+	size_t offsets[3] = { 0, 0, 0 };
+	size_t total_bytes = 0;
+	uvc_error_t err;
+
+	out->actual_bytes = 0;
+	err = uvc_mjpeg_planar_layout(in, widths, heights, &subsamp);
+	if (UNLIKELY(err != UVC_SUCCESS))
+		return err;
+
+	for (int i = 0; i < 3; i++) {
+		size_t plane_size;
+		if (!widths[i]) {
 			out->yuv_plane_widths[i] = 0;
 			out->yuv_plane_heights[i] = 0;
 			out->yuv_plane_offsets[i] = 0;
 			out->yuv_plane_strides[i] = 0;
 			continue;
 		}
-		if (UNLIKELY(plane_width <= 0 || plane_height <= 0))
-			return UVC_ERROR_INVALID_PARAM;
-		strides[i] = plane_width;
+		strides[i] = (int)widths[i];
 		plane_size = tj3YUVPlaneSize(i, (int)in->width, strides[i],
 			(int)in->height, subsamp);
 		if (UNLIKELY(!plane_size || total_bytes > (size_t)-1 - plane_size))
 			return UVC_ERROR_INVALID_PARAM;
 		offsets[i] = total_bytes;
 		total_bytes += plane_size;
-		out->yuv_plane_widths[i] = (uint32_t)plane_width;
-		out->yuv_plane_heights[i] = (uint32_t)plane_height;
+		out->yuv_plane_widths[i] = widths[i];
+		out->yuv_plane_heights[i] = heights[i];
 		out->yuv_plane_offsets[i] = offsets[i];
 		out->yuv_plane_strides[i] = (size_t)strides[i];
 	}
@@ -784,23 +946,12 @@ uvc_error_t uvc_mjpeg2yuv_planar(uvc_frame_t *in, uvc_frame_t *out) {
 	if (UNLIKELY(uvc_ensure_frame_size(out, total_bytes) < 0))
 		return UVC_ERROR_NO_MEM;
 
-	for (int i = 0; i < 3; i++) {
-		if (i > 0 && subsamp == TJSAMP_GRAY) {
-			planes[i] = NULL;
-			continue;
-		}
-		planes[i] = (unsigned char *)out->data + offsets[i];
-	}
+	for (int i = 0; i < 3; i++)
+		planes[i] = widths[i] ? (unsigned char *)out->data + offsets[i] : NULL;
 
-	if (UNLIKELY(tj3DecompressToYUVPlanes8(tj,
-			(const unsigned char *)in->data, in->actual_bytes,
-			planes, strides) != 0)) {
-		UVC_DIAG_LOGI("mjpeg-diag:planar-decode-fail seq=%u bytes=%zu err=%s",
-			in->sequence,
-			in->actual_bytes,
-			tj3GetErrorStr(tj));
-		return UVC_ERROR_OTHER;
-	}
+	err = uvc_mjpeg2yuv_planes(in, planes, strides);
+	if (UNLIKELY(err != UVC_SUCCESS))
+		return err;
 
 	out->width = in->width;
 	out->height = in->height;

@@ -11,8 +11,21 @@ struct libusb_interface;
 void _uvc_stream_try_acquire_outbuf(uvc_stream_handle_t *strmh);
 void _uvc_swap_buffers(uvc_stream_handle_t *strmh, const char *reason);
 
-int _uvc_mjpeg_payload_has_markers(const uvc_stream_handle_t *strmh);
-void _uvc_mjpeg_note_payload_append(uvc_stream_handle_t *strmh);
+int _uvc_mjpeg_payload_has_markers(uvc_stream_handle_t *strmh);
+/* Returns 1 when the MJPEG frame under assembly now ends with EOI (FFD9). */
+int _uvc_mjpeg_note_payload_append(uvc_stream_handle_t *strmh);
+/* EOI seen: publish the assembled MJPEG frame now when its UVC status is
+ * final (EOF in this payload's header); otherwise hold it until EOF, an FID
+ * flip or the next SOI.  Call right after a successful append that returned 1. */
+void _uvc_mjpeg_publish_on_eoi(uvc_stream_handle_t *strmh, uint8_t header_info,
+		const char *reason);
+/* 1 while a complete frame is held awaiting its trailing status. */
+int _uvc_mjpeg_eoi_pending(const uvc_stream_handle_t *strmh);
+/* 1 if this payload belongs to a frame already completed on EOI: drop it.
+ * Also resolves a frame held on EOI (applying a trailing ERR bit). */
+int _uvc_mjpeg_payload_after_eoi(uvc_stream_handle_t *strmh, uint8_t header_info,
+		const uint8_t *data, size_t data_len);
+void _uvc_mjpeg_scan_reset(uvc_stream_handle_t *strmh);
 void _uvc_diag_mjpeg_drop(uvc_stream_handle_t *strmh, const char *reason);
 void _uvc_diag_mjpeg_publish(uvc_stream_handle_t *strmh, const char *reason);
 void _uvc_diag_mjpeg_log_stream_start(const uvc_stream_ctrl_t *ctrl,

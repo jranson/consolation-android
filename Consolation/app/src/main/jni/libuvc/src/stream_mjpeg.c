@@ -2,6 +2,8 @@
  * MJPEG-specific diagnostics and JPEG bitstream checks (libuvc stream path).
  *********************************************************************/
 
+#include <string.h>
+
 #include "libuvc/stream_internal.h"
 
 static uint32_t _uvc_diag_sample_hash(const uint8_t *data, size_t len) {
@@ -97,11 +99,57 @@ static uint32_t _uvc_diag_mjpeg_header_hash(const uint8_t *data, size_t len,
 	return hash;
 }
 
-int _uvc_mjpeg_payload_has_markers(const uvc_stream_handle_t *strmh) {
+void _uvc_mjpeg_scan_reset(uvc_stream_handle_t *strmh) {
+	if (!strmh)
+		return;
+	/* Note: mjpeg_eoi_skip_* deliberately survive this reset; they are
+	 * cleared by the next FID flip (see _uvc_mjpeg_payload_after_eoi). */
+	strmh->mjpeg_eoi_pending = 0;
+	strmh->mjpeg_scan_pos = 0;
+	strmh->mjpeg_scan_found_sos = 0;
+	strmh->mjpeg_scan_embedded_soi = 0;
+}
+
+/* Advance the incremental marker scan over bytes appended to outbuf since the
+ * last call.  Examines every (i, i+1) pair with i >= 2, carrying one byte across
+ * append boundaries, so the result at publish time equals a full scan of
+ * outbuf[2 .. got_bytes).  Uses memchr to skip to 0xff candidates: entropy-coded
+ * JPEG data contains few 0xff bytes, so this runs near memcpy speed and the data
+ * is still cache-hot from the payload memcpy that preceded it. */
+static void _uvc_mjpeg_scan_advance(uvc_stream_handle_t *strmh) {
 	const uint8_t *data = strmh->outbuf;
 	const size_t len = strmh->got_bytes;
 	size_t i;
-	int found_sos = 0;
+
+	if (!data || len < 3)
+		return;
+	if (strmh->mjpeg_scan_embedded_soi)
+		return;	/* already rejected; nothing further changes the verdict */
+
+	i = strmh->mjpeg_scan_pos < 2 ? 2 : strmh->mjpeg_scan_pos;
+	while (i + 1 < len) {
+		const uint8_t *ff = memchr(data + i, 0xff, len - 1 - i);
+		uint8_t next;
+		if (!ff)
+			break;
+		i = (size_t)(ff - data);
+		next = data[i + 1];
+		if (next == 0xd8) {
+			strmh->mjpeg_scan_embedded_soi = 1;
+			break;
+		}
+		if (next == 0xda)
+			strmh->mjpeg_scan_found_sos = 1;
+		i++;
+	}
+	/* Next call resumes at the pair that starts on the current last byte, so a
+	 * marker split across two appends is still seen. */
+	strmh->mjpeg_scan_pos = len - 1;
+}
+
+int _uvc_mjpeg_payload_has_markers(uvc_stream_handle_t *strmh) {
+	const uint8_t *data = strmh->outbuf;
+	const size_t len = strmh->got_bytes;
 
 	if (strmh->frame_format != UVC_FRAME_FORMAT_MJPEG)
 		return 1;
@@ -111,26 +159,102 @@ int _uvc_mjpeg_payload_has_markers(const uvc_stream_handle_t *strmh) {
 		&& data[len - 2] == 0xff && data[len - 1] == 0xd9))
 		return 0;
 
-	for (i = 2; i + 1 < len - 2; i++) {
-		if (data[i] == 0xff && data[i + 1] == 0xd8)
-			return 0;
-		if (data[i] == 0xff && data[i + 1] == 0xda)
-			found_sos = 1;
-	}
-
-	return found_sos;
+	/* Catch up in case bytes were appended without _uvc_mjpeg_note_payload_append. */
+	_uvc_mjpeg_scan_advance(strmh);
+	return !strmh->mjpeg_scan_embedded_soi && strmh->mjpeg_scan_found_sos;
 }
 
-void _uvc_mjpeg_note_payload_append(uvc_stream_handle_t *strmh) {
+int _uvc_mjpeg_note_payload_append(uvc_stream_handle_t *strmh) {
 	const uint8_t *data;
 	const size_t len = strmh ? strmh->got_bytes : 0;
 
 	if (!strmh || strmh->frame_format != UVC_FRAME_FORMAT_MJPEG || len < 2)
-		return;
+		return 0;
+
+	_uvc_mjpeg_scan_advance(strmh);
 
 	data = strmh->outbuf;
-	if (data && data[len - 2] == 0xff && data[len - 1] == 0xd9)
+	if (data && data[len - 2] == 0xff && data[len - 1] == 0xd9) {
 		strmh->frame_complete_monotonic_ns = uvc_diag_now_ns();
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * Publish on EOI.  A JPEG is complete at its EOI marker, so waiting for the
+ * UVC EOF bit (often carried by a later header-only packet, i.e. after the
+ * next transfer completes) or for the FID flip (a whole frame interval later
+ * on cameras that never set EOF) only adds latency.  FFD9 cannot occur inside
+ * entropy-coded data (0xFF is always stuffed), so the tail check is exact.
+ *
+ * Complete is not the same as valid, though: a header-only trailer for this
+ * frame can still carry UVC_STREAM_ERR (the frame has a transmission hole but
+ * intact SOI/EOI).  So the frame is only published straight away when the
+ * payload that carried the EOI also carried EOF.  Otherwise it is held until
+ * a definitive boundary: a trailer with EOF, an FID flip, or the next frame's
+ * SOI.  Idle ISO slots and past behaviour of the device prove nothing about
+ * whether a trailer is still coming, so neither releases a held frame.
+ */
+static void _uvc_mjpeg_eoi_publish_now(uvc_stream_handle_t *strmh, const char *reason) {
+	strmh->mjpeg_eoi_pending = 0;
+	strmh->mjpeg_eoi_skip_valid = 1;
+	strmh->mjpeg_eoi_skip_fid = strmh->fid;
+	_uvc_swap_buffers(strmh, reason);
+}
+
+void _uvc_mjpeg_publish_on_eoi(uvc_stream_handle_t *strmh, uint8_t header_info,
+		const char *reason) {
+	if (!strmh || strmh->frame_format != UVC_FRAME_FORMAT_MJPEG)
+		return;
+	if (header_info & UVC_STREAM_EOF) {
+		_uvc_mjpeg_eoi_publish_now(strmh, reason);
+		return;
+	}
+	strmh->mjpeg_eoi_pending = 1;
+	strmh->mjpeg_eoi_pending_reason = reason;
+}
+
+int _uvc_mjpeg_eoi_pending(const uvc_stream_handle_t *strmh) {
+	return strmh && strmh->mjpeg_eoi_pending;
+}
+
+int _uvc_mjpeg_payload_after_eoi(uvc_stream_handle_t *strmh, uint8_t header_info,
+		const uint8_t *data, size_t data_len) {
+	const int new_frame =
+		((header_info & UVC_STREAM_FID) != (strmh->mjpeg_eoi_pending
+			? strmh->fid : strmh->mjpeg_eoi_skip_fid))
+		/* New SOI under the same FID (camera does not toggle FID). */
+		|| (data_len >= 2 && data[0] == 0xff && data[1] == 0xd8);
+
+	if (strmh->mjpeg_eoi_pending) {
+		if (new_frame) {
+			/* No trailer was sent: the held frame stands as assembled. */
+			_uvc_mjpeg_eoi_publish_now(strmh, strmh->mjpeg_eoi_pending_reason);
+			strmh->mjpeg_eoi_skip_valid = 0;
+			return 0;	/* this payload starts the next frame: process it */
+		}
+		/* Trailer (or padding) of the held frame: its ERR bit still counts. */
+		if (header_info & UVC_STREAM_ERR) {
+			strmh->bfh_err |= UVC_STREAM_ERR;	/* dropped at publish */
+			strmh->diag_bfh_err_packets++;
+		}
+		if (header_info & UVC_STREAM_EOF) {
+			_uvc_mjpeg_eoi_publish_now(strmh, strmh->mjpeg_eoi_pending_reason);
+			strmh->mjpeg_eoi_skip_valid = 0;	/* explicit end of the frame */
+		}
+		return 1;
+	}
+
+	if (!strmh->mjpeg_eoi_skip_valid)
+		return 0;
+	if (new_frame) {
+		strmh->mjpeg_eoi_skip_valid = 0;	/* next frame begins */
+		return 0;
+	}
+	if (header_info & UVC_STREAM_EOF)
+		strmh->mjpeg_eoi_skip_valid = 0;	/* explicit end of the published frame */
+	return 1;
 }
 
 void _uvc_diag_mjpeg_drop(uvc_stream_handle_t *strmh, const char *reason) {

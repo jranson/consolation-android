@@ -8,6 +8,7 @@
 #include <android/log.h>
 #endif
 
+#include <libusb/libusb_prealloc.h>
 #include "libuvc/stream_log.h"
 #include "libuvc/libuvc.h"
 #include "libuvc/libuvc_internal.h"
@@ -44,6 +45,8 @@ void _uvc_process_payload_bulk(uvc_stream_handle_t *strmh, const uint8_t *payloa
 
 	if (UNLIKELY(header_len < 2)) {
 		header_info = 0;
+		if (_uvc_mjpeg_eoi_pending(strmh))
+			return;	/* no status bits; never append past a held EOI */
 	} else {
 		//  @todo we should be checking the end-of-header bit
 		size_t variable_offset = 2;
@@ -63,15 +66,10 @@ void _uvc_process_payload_bulk(uvc_stream_handle_t *strmh, const uint8_t *payloa
 				data_len);
 		}
 
-		if (UNLIKELY(header_info & UVC_STREAM_ERR)) {
-			LOGI("startup-diag:libuvc bulk ERR bit set in header "
-				"(before_first_payload=%d)",
-				!strmh->first_video_payload_received);
-			/* A BFH ERR bit in a completed bulk payload is a device stream
-			 * condition, not a USB endpoint halt. Do not issue synchronous
-			 * control transfers from this hot path; true endpoint halts are
-			 * reported separately as LIBUSB_TRANSFER_STALL. */
-		}
+		/* Tail of a frame already published on its EOI marker: ignore. */
+		if (_uvc_mjpeg_payload_after_eoi(strmh, header_info,
+				payload + header_len, data_len))
+			return;
 
 		if ((strmh->fid != (header_info & UVC_STREAM_FID)) && strmh->got_bytes) {
 			/* The frame ID bit was flipped, but we have image data sitting
@@ -81,6 +79,26 @@ void _uvc_process_payload_bulk(uvc_stream_handle_t *strmh, const uint8_t *payloa
 		}
 
 		strmh->fid = header_info & UVC_STREAM_FID;
+
+		if (UNLIKELY(header_info & UVC_STREAM_ERR)) {
+			/* A BFH ERR bit in a completed bulk payload is a device stream
+			 * condition, not a USB endpoint halt. Do not issue synchronous
+			 * control transfers from this hot path; true endpoint halts are
+			 * reported separately as LIBUSB_TRANSFER_STALL.
+			 * Per UVC 1.5 2.4.3.3 the frame is damaged: mark it so it is
+			 * dropped at publish instead of decoded with a hole. */
+			if (strmh->got_bytes || data_len)
+				strmh->bfh_err |= UVC_STREAM_ERR;
+			strmh->diag_bfh_err_packets++;
+			if (strmh->diag_bfh_err_packets == 1
+					|| !(strmh->diag_bfh_err_packets % 1000)) {
+				LOGI("libuvc bulk ERR bit set in payload header count=%u "
+					"(before_first_payload=%d got_bytes=%zu data_len=%zu)",
+					strmh->diag_bfh_err_packets,
+					!strmh->first_video_payload_received,
+					strmh->got_bytes, data_len);
+			}
+		}
 
 		if (header_info & UVC_STREAM_PTS) {
 			// XXX saki some camera may send broken packet or failed to receive all data
@@ -113,7 +131,10 @@ void _uvc_process_payload_bulk(uvc_stream_handle_t *strmh, const uint8_t *payloa
 		if (LIKELY(strmh->got_bytes + data_len <= strmh->size_buf)) {
 			memcpy(strmh->outbuf + strmh->got_bytes, payload + header_len, data_len);
 			strmh->got_bytes += data_len;
-			_uvc_mjpeg_note_payload_append(strmh);
+			if (_uvc_mjpeg_note_payload_append(strmh)) {
+				_uvc_mjpeg_publish_on_eoi(strmh, header_info, "bulk-eoi");
+				return;
+			}
 		} else {
 			strmh->bfh_err |= UVC_STREAM_ERR;
 		}
@@ -146,7 +167,9 @@ uvc_error_t _uvc_stream_setup_bulk_transfers(uvc_stream_handle_t *strmh,
 			strmh->transfer_bufs[transfer_id],
 			strmh->cur_ctrl.dwMaxPayloadTransferSize, _uvc_stream_callback,
 			(void *)strmh, LIBUVC_STREAM_XFER_TIMEOUT_MS);
-
+		/* See stream_iso.c: build the URBs once, resubmit without allocating. */
+		if (UNLIKELY(libusb_prealloc_bulk_urbs(transfer) != LIBUSB_SUCCESS))
+			UVC_DEBUG("bulk transfer %d: URB prealloc failed, using slow path", transfer_id);
 	}
 	return UVC_SUCCESS;
 }
